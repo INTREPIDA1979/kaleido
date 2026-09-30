@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+google-cloud-aiplatform
+google-cloud-texttospeech
+python-dotenv
+firebase-admin
+mcp
+httpx
+langgraph
+langchain-mcp-adapters
+google-cloud-storage
