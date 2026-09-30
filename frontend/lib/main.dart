@@ -2,11 +2,18 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart'; // 追加: kReleaseModeを利用するため
 import 'package:image_picker/image_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:audioplayers/audioplayers.dart';
+
+// 追加: 環境に応じたベースURLをグローバルに定義
+const String baseUrl = String.fromEnvironment(
+  'API_URL',
+  defaultValue: 'http://127.0.0.1:8080',
+);
 
 void main() {
   runApp(const KaleidoApp());
@@ -99,7 +106,8 @@ class _ChatScreenState extends State<ChatScreen> {
       _messages.clear();
     });
     try {
-      final response = await http.get(Uri.parse('http://127.0.0.1:8080/api/v1/history?user_id=$userId'));
+      // 修正: baseUrlを利用
+      final response = await http.get(Uri.parse('$baseUrl/api/v1/history?user_id=$userId'));
       if (response.statusCode == 200) {
         final data = jsonDecode(utf8.decode(response.bodyBytes));
         final List<dynamic> list = data['history'] ?? [];
@@ -132,10 +140,9 @@ class _ChatScreenState extends State<ChatScreen> {
     );
 
     try {
-      const String backendUrl = String.fromEnvironment('BACKEND_URL', defaultValue: 'http://127.0.0.1:8080');
-      
+      // 修正: baseUrlを利用
       final response = await http.post(
-        Uri.parse('$backendUrl/api/v1/reset'),
+        Uri.parse('$baseUrl/api/v1/reset'),
       );
 
       if (response.statusCode == 200) {
@@ -258,7 +265,8 @@ class _ChatScreenState extends State<ChatScreen> {
         });
         _scrollToBottom();
 
-        final uploadUrl = Uri.parse('http://127.0.0.1:8080/api/v1/upload');
+        // 修正: baseUrlを利用
+        final uploadUrl = Uri.parse('$baseUrl/api/v1/upload');
         var request = http.MultipartRequest('POST', uploadUrl);
         final bytes = await imageToUpload.readAsBytes();
         request.files.add(http.MultipartFile.fromBytes('file', bytes, filename: imageToUpload.name));
@@ -292,7 +300,8 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     try {
-      final url = Uri.parse('http://127.0.0.1:8080/api/v1/chat');
+      // 修正: baseUrlを利用
+      final url = Uri.parse('$baseUrl/api/v1/chat');
       final response = await http.post(
         url,
         headers: {'Content-Type': 'application/json'},
@@ -319,8 +328,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
         if (_isTtsEnabled) {
           final cleanText = responseMessage.replaceAll(RegExp(r'[#*`_]'), '');
+          // 修正: baseUrlを利用
           final ttsResponse = await http.post(
-            Uri.parse('http://127.0.0.1:8080/api/v1/tts'),
+            Uri.parse('$baseUrl/api/v1/tts'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
               'text': cleanText,
@@ -678,7 +688,8 @@ class _AgentsScreenState extends State<AgentsScreen> {
 
   Future<void> _fetchAgents() async {
     try {
-      final response = await http.get(Uri.parse('http://127.0.0.1:8080/api/v1/agents?user_id=${widget.userId}'));
+      // 修正: baseUrlを利用
+      final response = await http.get(Uri.parse('$baseUrl/api/v1/agents?user_id=${widget.userId}'));
       if (response.statusCode == 200) {
         final data = jsonDecode(utf8.decode(response.bodyBytes));
         final List<dynamic> list = data['agents'] ?? [];
