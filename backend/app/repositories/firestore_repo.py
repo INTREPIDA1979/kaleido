@@ -8,7 +8,7 @@ class FirestoreRepository:
         # ローカルADCを利用して認証キーなしで自動接続
         self.db = firestore.Client()
 
-    def save_message(self, user_id: str, role: str, text: str, agent_id: str = None):
+    def save_message(self, user_id: str, role: str, text: str, agent_id: str = None, agent_name: str = None, theme_color: str = None):
         """メッセージをFirestoreに保存する"""
         message_id = str(uuid.uuid4())
         doc_ref = self.db.collection("users").document(user_id).collection("messages").document(message_id)
@@ -18,8 +18,13 @@ class FirestoreRepository:
             "text": text,
             "created_at": firestore.SERVER_TIMESTAMP
         }
+        # エージェント情報が存在する場合のみ追加
         if agent_id:
             data["agent_id"] = agent_id
+        if agent_name:
+            data["agent_name"] = agent_name
+        if theme_color:
+            data["theme_color"] = theme_color
             
         doc_ref.set(data)
 
@@ -32,13 +37,16 @@ class FirestoreRepository:
             "created_at", direction=firestore.Query.DESCENDING
         ).limit(limit).stream()
         
-        # Geminiに渡す形式に変換
+        # Geminiに渡す形式に変換しつつ、フロントエンド用データも付与
         history = []
         for doc in docs:
             data = doc.to_dict()
             history.append({
                 "role": "user" if data.get("role") == "user" else "model",
-                "parts": [{"text": data.get("text")}]
+                "parts": [{"text": data.get("text")}],
+                "agent_id": data.get("agent_id"),
+                "agent_name": data.get("agent_name"),
+                "theme_color": data.get("theme_color")
             })
             
         # 降順で取得したものを時系列（昇順）に戻す

@@ -191,25 +191,36 @@ async def chat_endpoint(request: ChatRequest):
             if not (response.candidates and response.candidates[0].function_calls):
                 break
 
-            function_call = response.candidates[0].function_calls[0]
-            args = {key: value for key, value in function_call.args.items()}
-            print(f"👉 5. Geminiがツール使用を判断: {function_call.name}")
+            # 💡 複数のツール呼び出し(Parallel Function Calling)に対応するためリストを取得
+            function_calls = response.candidates[0].function_calls
+            print(f"👉 5. Geminiがツール使用を判断: {[fc.name for fc in function_calls]}")
             
-            api_result = ""
-            if function_call.name.startswith("ekispert_"):
-                api_result = await mcp_client.execute_tool(function_call.name, args)
-            elif function_call.name.startswith("youcam_"):
-                api_result = await youcam_client.execute_tool(function_call.name, args)
-            else:
-                api_result = "Unknown tool requested."
+            # すべてのツール実行結果を格納するリスト
+            function_responses = []
             
-            print("👉 6. API結果をGeminiに返し、再生成を開始...")
-            response = await chat_session.send_message_async(
-                Part.from_function_response(
-                    name=function_call.name,
-                    response={"content": api_result}
+            for function_call in function_calls:
+                args = {key: value for key, value in function_call.args.items()}
+                print(f"   [Tool Call] {function_call.name}, args: {args}")
+                
+                api_result = ""
+                if function_call.name.startswith("ekispert_"):
+                    api_result = await mcp_client.execute_tool(function_call.name, args)
+                elif function_call.name.startswith("youcam_"):
+                    api_result = await youcam_client.execute_tool(function_call.name, args)
+                else:
+                    api_result = "Unknown tool requested."
+                
+                # 各ツールの実行結果をPartオブジェクトとして追加
+                function_responses.append(
+                    Part.from_function_response(
+                        name=function_call.name,
+                        response={"content": api_result}
+                    )
                 )
-            )
+            
+            print("👉 6. API結果をGeminiに一括で返し、再生成を開始...")
+            # 💡 複数の結果(Partのリスト)をそのまま渡す
+            response = await chat_session.send_message_async(function_responses)
             print("👉 7. Geminiからの再応答を受信！")
 
         # ==========================================
@@ -235,7 +246,14 @@ async def chat_endpoint(request: ChatRequest):
         theme_color = "#FFCDD2"
         voice_name = "ja-JP-Neural2-B"
 
-    repo.save_message(user_id=request.user_id, role="agent", text=reply_text, agent_id=agent_id)
+    repo.save_message(
+        user_id=request.user_id, 
+        role="agent", 
+        text=reply_text, 
+        agent_id=agent_id,
+        agent_name=agent_name,
+        theme_color=theme_color
+    )
 
     # 💡 クライアントが期待するフォーマットで返却
     return {
