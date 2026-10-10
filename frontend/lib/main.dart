@@ -169,8 +169,20 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
           _messages = list.map((e) {
             final rawRole = e['role'] ?? 'user';
             final normalizedRole = (rawRole == 'model' || rawRole == 'agent') ? 'agent' : 'user';
+
+            // 💡 ユーザー発言に含まれる「対象の画像URL: ...」を正規表現で綺麗に除去
+            String textContent = e['text'] ?? '';
+            if (normalizedRole == 'user') {
+              textContent = textContent
+                  .replaceAll(RegExp(r'\n*対象の画像URL:\s*https?://\S+'), '')
+                  .trim();
+              if (textContent.isEmpty) {
+                textContent = '[画像を送信しました]';
+              }
+            }
+
             return Message(
-              text: e['text'] ?? '',
+              text: textContent,
               role: normalizedRole,
               agentId: e['agent_id'],
               agentName: e['agent_name'],
@@ -220,36 +232,36 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     }
   }
 
-void _listen() async {
+  void _listen() async {
     if (!_isListening) {
-      // 💡 新しくマイク入力を開始するときはテキストをクリアして聞き取り開始
       _controller.clear();
 
-      bool available = await _speech.initialize(
-        onStatus: (status) {
-          if (status == 'done' || status == 'notListening') {
-            if (mounted && _isListening) {
-              setState(() => _isListening = false);
-              // 💡 音声対話モードなら無音検知で自動送信
-              if (_isVoiceOnlyMode && _controller.text.trim().isNotEmpty) {
-                _sendMessage();
+      bool available = _speech.isAvailable;
+      if (!available) {
+        available = await _speech.initialize(
+          onStatus: (status) {
+            if (status == 'done' || status == 'notListening') {
+              if (mounted && _isListening) {
+                setState(() => _isListening = false);
+                if (_isVoiceOnlyMode && _controller.text.trim().isNotEmpty) {
+                  _sendMessage();
+                }
               }
             }
-          }
-        },
-        onError: (errorNotification) {
-          print('音声認識エラー: $errorNotification');
-          if (mounted) {
-            setState(() => _isListening = false);
-          }
-        },
-      );
+          },
+          onError: (errorNotification) {
+            print('音声認識エラー: $errorNotification');
+            if (mounted) {
+              setState(() => _isListening = false);
+            }
+          },
+        );
+      }
 
       if (available) {
         setState(() => _isListening = true);
         await _speech.listen(
           onResult: (result) {
-            // 💡 マイクがOFFになった後は上書きしない
             if (!_isListening) return;
 
             setState(() {
@@ -259,32 +271,29 @@ void _listen() async {
               );
             });
           },
-          localeId: 'ja_JP',
+          localeId: 'ja-JP',
           listenMode: stt.ListenMode.dictation,
           cancelOnError: true,
           partialResults: true,
         );
       }
     } else {
-      // 💡 ユーザーがマイクボタンをタップして手動でOFFにしたとき
       await _speech.stop();
       setState(() => _isListening = false);
 
       if (_isVoiceOnlyMode) {
-        // 💡 音声対話モード：マイクOFF ＝ そのままメッセージ送信
         if (_controller.text.trim().isNotEmpty) {
           _sendMessage();
         }
-      } else {
-        // 💡 テキストモード：話したテキストは残す（クリアしない）
-        // そのままテキストボックスに残るので、ユーザーが確認・修正して送信ボタンを押せます
       }
     }
   }
 
   Future<void> _pickImage() async {
     final XFile? image = await _picker.pickImage(source: ImageSource.gallery);
-    if (image != null) setState(() => _selectedImage = image);
+    if (image != null) {
+      setState(() => _selectedImage = image);
+    }
   }
 
   void _clearImage() => setState(() => _selectedImage = null);
@@ -336,20 +345,16 @@ void _listen() async {
     if (text.isEmpty && _selectedImage == null) return;
     if (_isLoading) return;
 
-    // 💡 1. 音声認識が動いている場合は同期的に停止（遅延コールバックによるテキスト再代入を遮断）
     if (_isListening) {
       await _speech.stop();
       setState(() => _isListening = false);
     }
 
-    // 💡 2. 音声再生を停止
     await _audioPlayer.stop();
 
-    // 💡 3. 音声認識を完全に止めた後にテキストフィールドを即座に完全クリア
     _controller.value = TextEditingValue.empty;
     _controller.clear();
 
-    // 💡 4. 送信時に現在のアバターを退場アニメーションさせる
     _avatarAnimController.reverse();
 
     setState(() {
@@ -358,12 +363,10 @@ void _listen() async {
     });
 
     String imageUrl = '';
-    String displayMessage = text;
+    String displayMessage = text.isEmpty ? '[画像を送信しました]' : text;
 
-    // 画像が選択されている場合のアップロード処理
     if (_selectedImage != null) {
       try {
-        displayMessage = text.isEmpty ? '[画像を送信しました]' : '[画像を送信しました]\n$text';
         final imageToUpload = _selectedImage!;
         setState(() {
           _messages.add(Message(text: displayMessage, role: 'user'));
@@ -391,7 +394,6 @@ void _listen() async {
         return;
       }
     } else {
-      // 通常のテキストメッセージをタイムラインに追加
       setState(() => _messages.add(Message(text: text, role: 'user')));
       _scrollToBottom();
     }
@@ -430,7 +432,6 @@ void _listen() async {
             avatarUrl: avatarUrl,
           ));
 
-          // 💡 新しいアバター情報をセットして登場準備
           if (avatarUrl != null && avatarUrl.toString().isNotEmpty) {
             _currentSpeakingAvatarUrl = avatarUrl;
             _currentSpeakingAgentName = agentName;
@@ -439,12 +440,10 @@ void _listen() async {
           }
         });
 
-        // 💡 新しいアバターをバウンスアニメーションで登場
         if (_showAvatar) {
           _avatarAnimController.forward(from: 0.0);
         }
 
-        // 音声読み上げ（TTS）再生
         if (_isTtsEnabled) {
           final cleanText = responseMessage.replaceAll(RegExp(r'[#*`_]'), '');
           final ttsResponse = await http.post(
@@ -652,229 +651,376 @@ void _listen() async {
     );
   }
 
-  // 💡 ダイナミックな音声特化UIモード
+  // 💡 音声対話特化モード（画像添付ボタンを確実に画面下部中央へ常時表示）
   Widget _buildVoiceOnlyView() {
     final hasAvatar = _currentSpeakingAvatarUrl != null && _currentSpeakingAvatarUrl!.isNotEmpty;
-    final agentName = _currentSpeakingAgentName ?? '担当エージェント';
+    final agentName = _currentSpeakingAgentName ?? 'AIアシスタント';
     final themeColor = _currentSpeakingThemeColor ?? const Color(0xFFCE93D8);
 
     return Container(
       width: double.infinity,
+      height: double.infinity,
       decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
           colors: [
-            themeColor.withOpacity(0.12),
+            themeColor.withOpacity(0.15),
             Colors.white,
           ],
         ),
       ),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const SizedBox(height: 20),
-          // ステータステキスト
-          AnimatedSwitcher(
-            duration: const Duration(milliseconds: 300),
-            child: Container(
-              key: ValueKey<String>('$_isLoading$_isPlayingAudio$_isListening'),
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-              decoration: BoxDecoration(
-                color: themeColor.withOpacity(0.2),
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: Text(
-                _isLoading
-                    ? '⚡ エージェントが思考中...'
-                    : (_isPlayingAudio
-                        ? '🗣️ $agentName が回答中'
-                        : (_isListening ? '🎙️ お話しください...' : '$agentName に話しかけてみましょう')),
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold,
-                  color: getDarkerColor(themeColor),
-                  letterSpacing: 0.8,
+      child: SafeArea(
+        child: Column(
+          children: [
+            const SizedBox(height: 10),
+
+            // 1. ステータステキスト（何でも気軽にお話しください）
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 300),
+              child: Container(
+                key: ValueKey<String>('$_isLoading$_isPlayingAudio$_isListening'),
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
+                decoration: BoxDecoration(
+                  color: themeColor.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(
+                  _isLoading
+                      ? '⚡ 回答を考えています...'
+                      : (_isPlayingAudio
+                          ? '🗣️ $agentName が回答中'
+                          : (_isListening ? '🎙️ お話しください...' : '何でも気軽にお話しください')),
+                  style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: getDarkerColor(themeColor),
+                    letterSpacing: 0.5,
+                  ),
                 ),
               ),
             ),
-          ),
-          const Spacer(),
 
-          // 💡 メインビジュアル部：3重波紋 ＋ トークモーション
-          Center(
-            child: SizedBox(
-              width: 320,
-              height: 380,
-              child: Stack(
-                alignment: Alignment.center,
+            const SizedBox(height: 8),
+
+            // 2. 担当エージェントの名前バッジ
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 5),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.9),
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.06),
+                    blurRadius: 8,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  // 1. 同心円状の音波リップル（音声再生中に3重で広がる）
-                  if (_isPlayingAudio) ...[
-                    AnimatedBuilder(
-                      animation: _pulseController,
-                      builder: (context, child) {
-                        return Container(
-                          width: 260 + (_pulseController.value * 70),
-                          height: 320 + (_pulseController.value * 70),
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(36),
-                            border: Border.all(
-                              color: themeColor.withOpacity((1.0 - _pulseController.value) * 0.4),
-                              width: 3,
-                            ),
-                          ),
-                        );
-                      },
+                  Container(
+                    width: 10,
+                    height: 10,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: getDarkerColor(themeColor),
                     ),
-                    AnimatedBuilder(
-                      animation: _pulseController,
-                      builder: (context, child) {
-                        final val = (_pulseController.value + 0.5) % 1.0;
-                        return Container(
-                          width: 250 + (val * 50),
-                          height: 310 + (val * 50),
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(32),
-                            border: Border.all(
-                              color: themeColor.withOpacity((1.0 - val) * 0.3),
-                              width: 2,
-                            ),
-                          ),
-                        );
-                      },
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    '担当: $agentName',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                      color: getDarkerColor(themeColor),
                     ),
-                  ],
-
-                  // 2. キャラクター本体（発話中のブリージング＆バウンス）
-                  AnimatedBuilder(
-                    animation: _pulseController,
-                    builder: (context, child) {
-                      // 発話中は微かにバウンド＆スケール
-                      final bounce = _isPlayingAudio ? sin(_pulseController.value * pi) * 6.0 : 0.0;
-                      final scale = _isPlayingAudio ? 1.0 + (_pulseController.value * 0.03) : 1.0;
-
-                      return Transform.translate(
-                        offset: Offset(0, -bounce),
-                        child: Transform.scale(
-                          scale: scale,
-                          child: Container(
-                            height: 340,
-                            constraints: const BoxConstraints(maxWidth: 260),
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(24),
-                              boxShadow: [
-                                BoxShadow(
-                                  color: themeColor.withOpacity(_isPlayingAudio ? 0.45 : 0.15),
-                                  blurRadius: _isPlayingAudio ? 30 : 16,
-                                  spreadRadius: _isPlayingAudio ? 6 : 2,
-                                  offset: const Offset(0, 8),
-                                ),
-                              ],
-                            ),
-                            child: ClipRRect(
-                              borderRadius: BorderRadius.circular(24),
-                              child: hasAvatar
-                                  ? Image.network(
-                                      _currentSpeakingAvatarUrl!,
-                                      fit: BoxFit.contain,
-                                    )
-                                  : Center(
-                                      child: Icon(Icons.account_circle, size: 120, color: Colors.grey.shade400),
-                                    ),
-                            ),
-                          ),
-                        ),
-                      );
-                    },
                   ),
                 ],
               ),
             ),
-          ),
 
-          // 3. 音声再生中のイコライザーバー演出
-          if (_isPlayingAudio)
-            Padding(
-              padding: const EdgeInsets.only(top: 12.0),
-              child: AnimatedBuilder(
-                animation: _pulseController,
-                builder: (context, child) {
-                  return Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: List.generate(5, (index) {
-                      final wave = sin((_pulseController.value * 2 * pi) + (index * 0.8)).abs();
-                      return Container(
-                        margin: const EdgeInsets.symmetric(horizontal: 3),
-                        width: 4,
-                        height: 8 + (wave * 20),
-                        decoration: BoxDecoration(
-                          color: getDarkerColor(themeColor).withOpacity(0.7),
-                          borderRadius: BorderRadius.circular(4),
+            // 3. アバター画像（中央エリア）
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 8.0),
+                child: LayoutBuilder(
+                  builder: (context, constraints) {
+                    final maxW = constraints.maxWidth;
+                    final maxH = constraints.maxHeight;
+
+                    return Center(
+                      child: SizedBox(
+                        width: maxW,
+                        height: maxH,
+                        child: Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            if (_isPlayingAudio) ...[
+                              AnimatedBuilder(
+                                animation: _pulseController,
+                                builder: (context, child) {
+                                  return Container(
+                                    width: (maxW * 0.85) + (_pulseController.value * 50),
+                                    height: (maxH * 0.9) + (_pulseController.value * 50),
+                                    decoration: BoxDecoration(
+                                      borderRadius: BorderRadius.circular(36),
+                                      border: Border.all(
+                                        color: themeColor.withOpacity((1.0 - _pulseController.value) * 0.4),
+                                        width: 3,
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                              AnimatedBuilder(
+                                animation: _pulseController,
+                                builder: (context, child) {
+                                  final val = (_pulseController.value + 0.5) % 1.0;
+                                  return Container(
+                                    width: (maxW * 0.8) + (val * 40),
+                                    height: (maxH * 0.85) + (val * 40),
+                                    decoration: BoxDecoration(
+                                      borderRadius: BorderRadius.circular(32),
+                                      border: Border.all(
+                                        color: themeColor.withOpacity((1.0 - val) * 0.3),
+                                        width: 2,
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                            ],
+
+                            AnimatedBuilder(
+                              animation: _pulseController,
+                              builder: (context, child) {
+                                final bounce = _isPlayingAudio ? sin(_pulseController.value * pi) * 6.0 : 0.0;
+                                final scale = _isPlayingAudio ? 1.0 + (_pulseController.value * 0.02) : 1.0;
+
+                                return Transform.translate(
+                                  offset: Offset(0, -bounce),
+                                  child: Transform.scale(
+                                    scale: scale,
+                                    child: Container(
+                                      constraints: BoxConstraints(
+                                        maxWidth: maxW * 0.9,
+                                        maxHeight: maxH * 0.95,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        borderRadius: BorderRadius.circular(28),
+                                        boxShadow: [
+                                          BoxShadow(
+                                            color: themeColor.withOpacity(_isPlayingAudio ? 0.45 : 0.18),
+                                            blurRadius: _isPlayingAudio ? 32 : 18,
+                                            spreadRadius: _isPlayingAudio ? 6 : 2,
+                                            offset: const Offset(0, 8),
+                                          ),
+                                        ],
+                                      ),
+                                      child: ClipRRect(
+                                        borderRadius: BorderRadius.circular(28),
+                                        child: hasAvatar
+                                            ? Image.network(
+                                                _currentSpeakingAvatarUrl!,
+                                                fit: BoxFit.contain,
+                                              )
+                                            : Center(
+                                                child: Icon(Icons.account_circle, size: 140, color: Colors.grey.shade400),
+                                              ),
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                          ],
                         ),
-                      );
-                    }),
-                  );
-                },
+                      ),
+                    );
+                  },
+                ),
               ),
             ),
 
-          const Spacer(),
+            // 4. 音声再生中のイコライザー波形
+            if (_isPlayingAudio)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6.0),
+                child: AnimatedBuilder(
+                  animation: _pulseController,
+                  builder: (context, child) {
+                    return Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: List.generate(5, (index) {
+                        final wave = sin((_pulseController.value * 2 * pi) + (index * 0.8)).abs();
+                        return Container(
+                          margin: const EdgeInsets.symmetric(horizontal: 3),
+                          width: 4,
+                          height: 8 + (wave * 20),
+                          decoration: BoxDecoration(
+                            color: getDarkerColor(themeColor).withOpacity(0.7),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                        );
+                      }),
+                    );
+                  },
+                ),
+              ),
 
-          // 音声認識中プレビュー
-          if (_controller.text.isNotEmpty && _isListening)
+            // 💡 添付された画像のプレビューチップ
+            if (_selectedImage != null)
+              Container(
+                margin: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 4.0),
+                padding: const EdgeInsets.symmetric(horizontal: 14.0, vertical: 6.0),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.95),
+                  borderRadius: BorderRadius.circular(20),
+                  boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 4)],
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.image, color: Colors.blue, size: 18),
+                    const SizedBox(width: 8),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 180),
+                      child: Text(
+                        _selectedImage!.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 13, color: Colors.black87),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    InkWell(
+                      onTap: _clearImage,
+                      child: const Icon(Icons.close, size: 18, color: Colors.black54),
+                    ),
+                  ],
+                ),
+              ),
+
+            // 音声認識中テキストプレビュー
+            if (_controller.text.isNotEmpty && _isListening)
+              Container(
+                margin: const EdgeInsets.symmetric(horizontal: 32.0, vertical: 4.0),
+                padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.92),
+                  borderRadius: BorderRadius.circular(16),
+                  boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 8)],
+                ),
+                child: Text(
+                  _controller.text,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 15, color: Colors.black87, fontWeight: FontWeight.w500),
+                ),
+              ),
+
+            // 💡 5. 最下部固定操作エリア（画像添付ボタン ＋ マイク ＋ 送信ボタン）
             Container(
-              margin: const EdgeInsets.symmetric(horizontal: 36.0, vertical: 8.0),
-              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 10.0),
-              decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.9),
-                borderRadius: BorderRadius.circular(16),
-                boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 8)],
-              ),
-              child: Text(
-                _controller.text,
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 15, color: Colors.black87, fontWeight: FontWeight.w500),
-              ),
-            ),
+              padding: const EdgeInsets.only(bottom: 24.0, top: 8.0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  // 📷 画像添付ボタン（大きく見やすい丸ボタン）
+                  Container(
+                    width: 58,
+                    height: 58,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Colors.white,
+                      border: Border.all(color: Colors.black12, width: 1.5),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.1),
+                          blurRadius: 10,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
+                    child: IconButton(
+                      icon: Icon(
+                        _selectedImage != null ? Icons.check_circle : Icons.add_photo_alternate,
+                        color: _selectedImage != null ? Colors.blueAccent : Colors.black87,
+                        size: 30,
+                      ),
+                      tooltip: '画像を添付',
+                      onPressed: _isLoading ? null : _pickImage,
+                    ),
+                  ),
 
-          // 4. マイクボタン
-          Padding(
-            padding: const EdgeInsets.only(bottom: 48.0),
-            child: GestureDetector(
-              onTap: _isLoading ? null : _listen,
-              child: AnimatedBuilder(
-                animation: _pulseController,
-                builder: (context, child) {
-                  final scale = _isListening ? 1.0 + (_pulseController.value * 0.12) : 1.0;
-                  return Transform.scale(
-                    scale: scale,
-                    child: Container(
-                      width: 84,
-                      height: 84,
+                  const SizedBox(width: 24),
+
+                  // 🎙️ メインマイクボタン
+                  GestureDetector(
+                    onTap: _isLoading ? null : _listen,
+                    child: AnimatedBuilder(
+                      animation: _pulseController,
+                      builder: (context, child) {
+                        final scale = _isListening ? 1.0 + (_pulseController.value * 0.12) : 1.0;
+                        return Transform.scale(
+                          scale: scale,
+                          child: Container(
+                            width: 80,
+                            height: 80,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: _isListening ? Colors.redAccent : Colors.black87,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: (_isListening ? Colors.redAccent : Colors.black).withOpacity(0.35),
+                                  blurRadius: 20,
+                                  offset: const Offset(0, 8),
+                                ),
+                              ],
+                            ),
+                            child: Icon(
+                              _isListening ? Icons.mic : Icons.mic_none,
+                              color: Colors.white,
+                              size: 40,
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+
+                  const SizedBox(width: 24),
+
+                  // 🚀 送信ボタン（画像がある場合は表示、なければ左右対称維持用のスペース）
+                  if (_selectedImage != null)
+                    Container(
+                      width: 58,
+                      height: 58,
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
-                        color: _isListening ? Colors.redAccent : Colors.black87,
+                        color: Colors.blueAccent,
                         boxShadow: [
                           BoxShadow(
-                            color: (_isListening ? Colors.redAccent : Colors.black).withOpacity(0.35),
-                            blurRadius: 20,
-                            offset: const Offset(0, 8),
+                            color: Colors.blueAccent.withOpacity(0.35),
+                            blurRadius: 10,
+                            offset: const Offset(0, 4),
                           ),
                         ],
                       ),
-                      child: Icon(
-                        _isListening ? Icons.mic : Icons.mic_none,
-                        color: Colors.white,
-                        size: 40,
+                      child: IconButton(
+                        icon: const Icon(Icons.send, color: Colors.white, size: 26),
+                        tooltip: '送信',
+                        onPressed: _isLoading ? null : _sendMessage,
                       ),
-                    ),
-                  );
-                },
+                    )
+                  else
+                    const SizedBox(width: 58, height: 58),
+                ],
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -952,7 +1098,6 @@ void _listen() async {
               ],
             ),
           ),
-          // 💡 音声対話特化モードの切り替えボタン
           IconButton(
             icon: Icon(
               _isVoiceOnlyMode ? Icons.chat_bubble_outline : Icons.headphones,
@@ -960,11 +1105,9 @@ void _listen() async {
             ),
             tooltip: _isVoiceOnlyMode ? 'テキストチャットモードに切替' : '音声対話モードに切替',
             onPressed: () {
-              // 💡 切り替え時にマイクが動いていれば停止
               if (_isListening) {
                 _speech.stop();
               }
-              // 💡 入力中のテキストフィールドを完全にクリア
               _controller.clear();
 
               setState(() {
