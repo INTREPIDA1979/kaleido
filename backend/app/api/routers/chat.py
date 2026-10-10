@@ -1,5 +1,5 @@
 import json
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import vertexai
 from vertexai.generative_models import GenerativeModel, Content, Part, GenerationConfig
@@ -7,16 +7,15 @@ from app.repositories.firestore_repo import FirestoreRepository
 from app.services.router_service import RouterService
 from app.services.mcp_service import EkispertMCPClient
 from app.services.youcam_service import YouCamService
-from app.services.agent_factory import AgentFactory # 💡 AgentFactoryを追加
+from app.services.agent_factory import AgentFactory
 
 router = APIRouter()
 
 vertexai.init(project="certain-song-509313-d8", location="asia-northeast1")
 repo = FirestoreRepository()
 router_service = RouterService()
-factory = AgentFactory() # 💡 インスタンス化
+factory = AgentFactory() 
 
-# 💡 インスタンスをグローバルに保持し、初回取得時のツールキャッシュを使い回す
 mcp_client = EkispertMCPClient()
 youcam_client = YouCamService() 
 
@@ -24,9 +23,6 @@ class ChatRequest(BaseModel):
     user_id: str
     message: str
 
-# ==========================================
-# 🛡️ セキュリティ層：プロンプトインジェクション検知
-# ==========================================
 def is_safe_prompt(text: str) -> bool:
     dangerous_keywords = [
         "命令を無視", 
@@ -41,11 +37,57 @@ def is_safe_prompt(text: str) -> bool:
             return False
     return True
 
+async def update_memory_background(user_id: str, agent_id: str, user_text: str, ai_text: str, current_global: dict, current_agent: dict):
+    try:
+        memory_prompt = f"""
+あなたはユーザーの記憶を管理するバックグラウンドエージェントです。
+現在の記憶と最新の会話をもとに、記憶をアップデートしてください。
+
+【現在のグローバル記憶】
+{current_global}
+
+【現在のエージェント固有記憶】
+{current_agent}
+
+【最新の会話】
+ユーザー: {user_text}
+AI: {ai_text}
+
+【ルール】
+以下のJSONフォーマットのみを絶対に出力してください。余計な文字列やMarkdown（```jsonなど）は不要です。
+{{
+    "global_memory": {{
+        "preferences": "ユーザーの全体的な嗜好（更新・追加があれば）",
+        "long_term_summary": "長期的に覚えておくべき事実（更新・追加があれば）",
+        "working_memory": "直近の会話の文脈や一時的な状態"
+    }},
+    "agent_memory": {{
+        "long_term_summary": "この専門分野における長期的な事実",
+        "working_memory": "この専門分野における直近のタスクや状態"
+    }}
+}}
+"""
+        model = GenerativeModel("gemini-3.5-flash", generation_config=GenerationConfig(temperature=0.1))
+        response = model.generate_content(memory_prompt)
+        
+        json_text = response.text.strip().replace("```json", "").replace("```", "")
+        new_memory = json.loads(json_text)
+
+        repo = FirestoreRepository()
+        if "global_memory" in new_memory:
+            repo.update_memory(user_id, "global", new_memory["global_memory"])
+        if "agent_memory" in new_memory:
+            repo.update_memory(user_id, agent_id, new_memory["agent_memory"])
+            
+        print("✅ [Memory] 記憶のバックグラウンド更新が完了しました。")
+        
+    except Exception as e:
+        print(f"⚠️ [Memory Error] 記憶の更新に失敗しました: {e}")
+
 @router.post("/chat")
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks):
     print(f"\n💬 ユーザー入力: {request.message}")
 
-    # 🚨 AIに渡す前にセキュリティチェックを実施
     if not is_safe_prompt(request.message):
         print("❌ [Security] プロンプトインジェクションの可能性を検知し、ブロックしました。")
         raise HTTPException(status_code=400, detail="許可されていない形式のプロンプトが含まれています。")
@@ -53,15 +95,9 @@ async def chat_endpoint(request: ChatRequest):
     repo.save_message(user_id=request.user_id, role="user", text=request.message)
 
     try:
-        # ==========================================
-        # 【1次選考】ベクトル検索で候補を抽出
-        # ==========================================
         print("👉 1. ベクトル検索で候補を抽出します...")
         top_agents = router_service.find_best_agents(request.message, limit=3)
         
-        # 💡 【真の原因解決】ベクトル検索の閾値落ち（候補ゼロ）対策
-        # 検索結果が空になってしまった場合、ユーザーが利用可能なエージェントを直接取得して候補に補充する
-        # （LLMに「現在の手持ちカード」を見せるための純粋なフォールバック）
         if not top_agents:
             print("👉 [Debug] ベクトル検索で候補が絞れなかったため、全保有エージェントを展開します")
             try:
@@ -69,21 +105,16 @@ async def chat_endpoint(request: ChatRequest):
                 top_agents = []
                 for doc in docs:
                     data = doc.to_dict()
-                    # 💡 データベースの構造に合わせて、doc.id や agent_id を 'id' として統一する
                     data["id"] = data.get("id", data.get("agent_id", doc.id))
                     top_agents.append(data)
             except Exception as e:
                 print(f"👉 [Debug] エージェント展開エラー: {e}")
 
-        # 直近の会話履歴を取得し、文脈を把握する
         raw_history = repo.get_chat_history(request.user_id, limit=6)
         history_text = "\n".join([f"{h['role']}: {h['parts'][0]['text']}" for h in raw_history[-2:]]) if raw_history else "なし"
         
         candidates_str = "\n".join([f"- ID: {a['id']}, 名前: {a['name']}, 説明: {a.get('description', '')}" for a in top_agents])
 
-        # ==========================================
-        # 【2次選考】超軽量LLMルーターによる文脈判定 (ピュア版)
-        # ==========================================
         routing_prompt = f"""
 あなたはユーザーの発言の意図を汲み取り、既存のAIエージェントに割り当てるか、新規作成するかを判定するルーターです。
 
@@ -111,7 +142,6 @@ async def chat_endpoint(request: ChatRequest):
         routed_result = router_response.text.strip().replace("`", "").replace("\n", "")
         print(f"👉 [Debug] ルーターの判定結果: {routed_result}") 
         
-        # 💡 ルーターの判定結果に従ってエージェントを決定
         if routed_result == "new" or not top_agents:
             print("👉 3. 【判定: 新規話題】全く新しい専門家を生成します...")
             active_agent = factory.generate_and_save_agent(request.message, request.user_id)
@@ -119,15 +149,9 @@ async def chat_endpoint(request: ChatRequest):
             active_agent = next((a for a in top_agents if a["id"] == routed_result), top_agents[0])
             print(f"👉 3. 【判定: 文脈継続】既存エージェント「{active_agent.get('name')}」が引き続き担当します。")
 
-        # ==========================================
-        # 【記憶のロード】
-        # ==========================================
         global_memory = repo.get_memory(request.user_id, "global")
         agent_mem = repo.get_memory(request.user_id, active_agent["id"])
 
-        # ==========================================
-        # 【ツール取得】
-        # ==========================================
         print("👉 2. ツール取得開始...")
         try:
             ekispert_tools = await mcp_client.get_gemini_tools()
@@ -142,10 +166,6 @@ async def chat_endpoint(request: ChatRequest):
             print(f"⚠️ ツール取得エラー: {e}")
             tools = []
 
-        # ==========================================
-        # 【2次選考】システムプロンプトの構築とモデル初期化
-        # ==========================================
-        # 💡 抽出したエージェントの指示をベースに、ツール利用ルールを注入
         agent_system_prompt = active_agent.get("system_prompt", "あなたは親切なアシスタントです。")
         
         system_instruction = f"""
@@ -154,7 +174,9 @@ async def chat_endpoint(request: ChatRequest):
 【ユーザーに関する記憶】
 - 全体的な嗜好・前提: {global_memory.get('preferences', '')}
 - 全体的な長期記憶: {global_memory.get('long_term_summary', '')}
-- エージェント固有の記憶: {agent_mem.get('long_term_summary', '')}
+- 全体的な短期記憶: {global_memory.get('working_memory', '')}
+- エージェント固有の長期記憶: {agent_mem.get('long_term_summary', '')}
+- エージェント固有の短期記憶: {agent_mem.get('working_memory', '')}
 
 【絶対ルール：外部ツールの利用（厳守）】
 1. ⚠️警告: あなたは画像URLにアクセスして中身を直接見ることはできません。「写真を見ました」と嘘をつかないでください。
@@ -164,7 +186,6 @@ async def chat_endpoint(request: ChatRequest):
 5. 出力はJSONではなく、ユーザーに直接語りかける自然なテキストで返答してください。
 6. ⚠️重要: 音声読み上げを前提としているため、太字（**）や見出し（#）などのMarkdown装飾は一切使用せず、必ずプレーンテキストのみで出力してください。
 """
-        # JSON出力をやめ、自然なテキスト生成に変更
         config = GenerationConfig(temperature=0.7)
         model = GenerativeModel(
             "gemini-3.5-flash",
@@ -184,18 +205,13 @@ async def chat_endpoint(request: ChatRequest):
         response = await chat_session.send_message_async(request.message)
         print("👉 4. Geminiから初回レスポンス受信！")
         
-        # ==========================================
-        # Function Calling のハンドリング (堅牢なエージェントループ)
-        # ==========================================
         for _ in range(5):
             if not (response.candidates and response.candidates[0].function_calls):
                 break
 
-            # 💡 複数のツール呼び出し(Parallel Function Calling)に対応するためリストを取得
             function_calls = response.candidates[0].function_calls
             print(f"👉 5. Geminiがツール使用を判断: {[fc.name for fc in function_calls]}")
             
-            # すべてのツール実行結果を格納するリスト
             function_responses = []
             
             for function_call in function_calls:
@@ -210,7 +226,6 @@ async def chat_endpoint(request: ChatRequest):
                 else:
                     api_result = "Unknown tool requested."
                 
-                # 各ツールの実行結果をPartオブジェクトとして追加
                 function_responses.append(
                     Part.from_function_response(
                         name=function_call.name,
@@ -219,24 +234,20 @@ async def chat_endpoint(request: ChatRequest):
                 )
             
             print("👉 6. API結果をGeminiに一括で返し、再生成を開始...")
-            # 💡 複数の結果(Partのリスト)をそのまま渡す
             response = await chat_session.send_message_async(function_responses)
             print("👉 7. Geminiからの再応答を受信！")
 
-        # ==========================================
-        # 最終テキストの抽出 (JSONパースを撤廃し、生テキストをそのまま使用)
-        # ==========================================
         if response.candidates and response.candidates[0].function_calls:
             raise ValueError("AIがツール呼び出しの無限ループに陥りました。")
 
         reply_text = response.text.strip()
         print(f"👉 [Debug] Gemini最終出力: {reply_text}")
 
-        # 💡 エージェント情報は辞書からそのまま取り出す（ハードコーディング全廃止）
         agent_id = active_agent.get("id", "default")
         agent_name = active_agent.get("name", "AIアシスタント")
         theme_color = active_agent.get("theme_color", "#F3E5F5")
         voice_name = active_agent.get("voice_name", "ja-JP-Neural2-B")
+        avatar_url = active_agent.get("avatar_url", "") # 💡 追加: アバターURLを取得
 
     except Exception as e:
         print(f"⚠️ 処理エラー: {e}")
@@ -245,22 +256,35 @@ async def chat_endpoint(request: ChatRequest):
         agent_name = "システムエラー"
         theme_color = "#FFCDD2"
         voice_name = "ja-JP-Neural2-B"
+        avatar_url = "" # 💡 追加: エラー時は空文字
 
+    # 💡 追加: kwargs で avatar_url を渡すように変更
     repo.save_message(
         user_id=request.user_id, 
         role="agent", 
         text=reply_text, 
         agent_id=agent_id,
         agent_name=agent_name,
-        theme_color=theme_color
+        theme_color=theme_color,
+        avatar_url=avatar_url # 💡 追加
     )
 
-    # 💡 クライアントが期待するフォーマットで返却
+    background_tasks.add_task(
+        update_memory_background,
+        request.user_id,
+        agent_id,
+        request.message,
+        reply_text,
+        global_memory,
+        agent_mem
+    )
+
     return {
         "agent_id": agent_id,
         "agent_name": agent_name,
         "theme_color": theme_color,
         "voice_name": voice_name,
+        "avatar_url": avatar_url, # 💡 追加: 応答に含める
         "response_message": reply_text
     }
 
@@ -270,15 +294,15 @@ async def get_history(user_id: str, limit: int = 15):
     raw_history = repo.get_chat_history(user_id, limit=limit)
     
     formatted_history = []
-    # 💡 古い順に並べ直してフロントエンドに渡す
-    for h in reversed(raw_history):
+    for h in raw_history:
         text = h["parts"][0]["text"] if "parts" in h and h["parts"] else h.get("text", "")
         formatted_history.append({
             "role": h.get("role", "user"),
             "text": text,
             "agent_id": h.get("agent_id"),
             "agent_name": h.get("agent_name"),
-            "theme_color": h.get("theme_color")
+            "theme_color": h.get("theme_color"),
+            "avatar_url": h.get("avatar_url") # 💡 追加: 履歴取得時にも含める
         })
         
     return {"history": formatted_history}

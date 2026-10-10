@@ -17,7 +17,8 @@ def get_all_agents(user_id: str = "user_a"):
                 "id": doc.id,
                 "name": data.get("name", "名称未設定"),
                 "description": data.get("description", ""),
-                "theme_color": data.get("theme_color", "#F3E5F5")
+                "theme_color": data.get("theme_color", "#F3E5F5"),
+                "avatar_url": data.get("avatar_url", "") # 💡 追加: アバターURLを返す
             })
         return {"agents": agents}
     except Exception as e:

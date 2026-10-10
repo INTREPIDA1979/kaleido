@@ -8,7 +8,8 @@ class FirestoreRepository:
         # ローカルADCを利用して認証キーなしで自動接続
         self.db = firestore.Client()
 
-    def save_message(self, user_id: str, role: str, text: str, agent_id: str = None, agent_name: str = None, theme_color: str = None):
+    # 💡 引数に avatar_url: str = None を追加
+    def save_message(self, user_id: str, role: str, text: str, agent_id: str = None, agent_name: str = None, theme_color: str = None, avatar_url: str = None):
         """メッセージをFirestoreに保存する"""
         message_id = str(uuid.uuid4())
         doc_ref = self.db.collection("users").document(user_id).collection("messages").document(message_id)
@@ -25,6 +26,8 @@ class FirestoreRepository:
             data["agent_name"] = agent_name
         if theme_color:
             data["theme_color"] = theme_color
+        if avatar_url:
+            data["avatar_url"] = avatar_url  # 💡 Firestoreへ保存
             
         doc_ref.set(data)
 
@@ -46,7 +49,8 @@ class FirestoreRepository:
                 "parts": [{"text": data.get("text")}],
                 "agent_id": data.get("agent_id"),
                 "agent_name": data.get("agent_name"),
-                "theme_color": data.get("theme_color")
+                "theme_color": data.get("theme_color"),
+                "avatar_url": data.get("avatar_url")  # 💡 履歴取得時にもavatar_urlを含める
             })
             
         # 降順で取得したものを時系列（昇順）に戻す
@@ -74,7 +78,8 @@ class FirestoreRepository:
                 "description": data.get("description"),
                 "system_prompt": data.get("system_prompt"),
                 "distance": data.get("distance"),
-                "theme_color": data.get("theme_color") # 💡 DBからテーマカラーも取得するよう追加
+                "theme_color": data.get("theme_color"),
+                "avatar_url": data.get("avatar_url", "")  # 💡 ベクトル検索結果にもavatar_urlを含める
             })
         return agents
     
@@ -98,22 +103,33 @@ class FirestoreRepository:
         doc_ref.set(default_memory)
         return default_memory
 
-    # 💡 引数に theme_color を追加し、デフォルト値を設定
-    def create_agent(self, agent_id: str, name: str, description: str, system_prompt: str, embedding: list[float], theme_color: str = "#F3E5F5", voice_name: str = "ja-JP-Neural2-B", user_id: str = "user_a"):
+    def create_agent(self, agent_id: str, name: str, description: str, system_prompt: str, embedding: list[float], theme_color: str = "#F3E5F5", voice_name: str = "ja-JP-Neural2-B", user_id: str = "user_a", avatar_url: str = ""):
         doc_ref = self.db.collection("agents").document(agent_id)
         doc_ref.set({
-            "user_id": user_id, # 👈 追加
+            "user_id": user_id, 
             "name": name,
             "description": description,
             "system_prompt": system_prompt,
             "embedding": embedding,
             "theme_color": theme_color,
-            "voice_name": voice_name
+            "voice_name": voice_name,
+            "avatar_url": avatar_url
         })
         return {
             "id": agent_id,
             "name": name,
             "description": description,
             "system_prompt": system_prompt,
-            "theme_color": theme_color # 💡 戻り値にも追加
+            "theme_color": theme_color,
+            "avatar_url": avatar_url
         }
+
+    def update_memory(self, user_id: str, agent_id: str, memory_data: dict):
+        """記憶をFirestoreに保存・更新する"""
+        if agent_id == "global":
+            doc_ref = self.db.collection("users").document(user_id).collection("global_memory").document("orchestrator")
+        else:
+            doc_ref = self.db.collection("users").document(user_id).collection("agent_memories").document(agent_id)
+        
+        # 既存のデータとマージして更新
+        doc_ref.set(memory_data, merge=True)

@@ -10,3 +10,5 @@ httpx
 langgraph
 langchain-mcp-adapters
 google-cloud-storage
+pillow
+google.genai

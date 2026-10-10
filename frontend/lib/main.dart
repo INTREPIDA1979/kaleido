@@ -2,14 +2,12 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter/foundation.dart'; // 追加: kReleaseModeを利用するため
 import 'package:image_picker/image_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:audioplayers/audioplayers.dart';
 
-// 追加: 環境に応じたベースURLをグローバルに定義
 const String baseUrl = String.fromEnvironment(
   'API_URL',
   defaultValue: 'http://127.0.0.1:8080',
@@ -59,6 +57,7 @@ class Message {
   final String? agentId;
   final String? agentName;
   final String? themeColor;
+  final String? avatarUrl;
 
   Message({
     required this.text,
@@ -66,6 +65,7 @@ class Message {
     this.agentId,
     this.agentName,
     this.themeColor,
+    this.avatarUrl,
   });
 }
 
@@ -76,7 +76,7 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   final TextEditingController _controller = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   List<Message> _messages = [];
@@ -89,36 +89,107 @@ class _ChatScreenState extends State<ChatScreen> {
   late AudioPlayer _audioPlayer;
   bool _isListening = false;
   bool _isTtsEnabled = true;
-  
+  bool _isVoiceOnlyMode = false;
+  bool _isPlayingAudio = false;
+
   String _currentUserId = 'user_a';
+
+  String? _currentSpeakingAvatarUrl;
+  String? _currentSpeakingAgentName;
+  Color? _currentSpeakingThemeColor;
+  bool _showAvatar = false;
+
+  late AnimationController _avatarAnimController;
+  late Animation<double> _scaleAnimation;
+  late Animation<Offset> _slideAnimation;
+  late AnimationController _pulseController;
 
   @override
   void initState() {
     super.initState();
     _speech = stt.SpeechToText();
     _audioPlayer = AudioPlayer();
+
+    _avatarAnimController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 600),
+    );
+    _scaleAnimation = CurvedAnimation(
+      parent: _avatarAnimController,
+      curve: Curves.elasticOut,
+    );
+    _slideAnimation = Tween<Offset>(
+      begin: const Offset(0.2, -0.1),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(
+      parent: _avatarAnimController,
+      curve: Curves.easeOutBack,
+    ));
+
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1500),
+    )..repeat(reverse: true);
+
+    _audioPlayer.onPlayerStateChanged.listen((state) {
+      if (mounted) {
+        setState(() {
+          _isPlayingAudio = (state == PlayerState.playing);
+        });
+      }
+    });
+
     _fetchHistory(_currentUserId);
+  }
+
+  @override
+  void dispose() {
+    _audioPlayer.dispose();
+    _controller.dispose();
+    _scrollController.dispose();
+    _avatarAnimController.dispose();
+    _pulseController.dispose();
+    super.dispose();
   }
 
   Future<void> _fetchHistory(String userId) async {
     setState(() {
       _isLoading = true;
       _messages.clear();
+      _showAvatar = false;
     });
+    _avatarAnimController.reset();
+
     try {
-      // 修正: baseUrlを利用
       final response = await http.get(Uri.parse('$baseUrl/api/v1/history?user_id=$userId'));
       if (response.statusCode == 200) {
         final data = jsonDecode(utf8.decode(response.bodyBytes));
         final List<dynamic> list = data['history'] ?? [];
         setState(() {
-          _messages = list.map((e) => Message(
-            text: e['text'] ?? '',
-            role: e['role'] ?? 'user',
-            agentId: e['agent_id'],
-            agentName: e['agent_name'],
-            themeColor: e['theme_color'],
-          )).toList();
+          _messages = list.map((e) {
+            final rawRole = e['role'] ?? 'user';
+            final normalizedRole = (rawRole == 'model' || rawRole == 'agent') ? 'agent' : 'user';
+            return Message(
+              text: e['text'] ?? '',
+              role: normalizedRole,
+              agentId: e['agent_id'],
+              agentName: e['agent_name'],
+              themeColor: e['theme_color'],
+              avatarUrl: e['avatar_url'],
+            );
+          }).toList();
+
+          final lastAgentMsg = _messages.lastWhere(
+            (m) => m.role == 'agent' && m.avatarUrl != null && m.avatarUrl!.isNotEmpty,
+            orElse: () => Message(text: '', role: 'user'),
+          );
+          if (lastAgentMsg.avatarUrl != null) {
+            _currentSpeakingAvatarUrl = lastAgentMsg.avatarUrl;
+            _currentSpeakingAgentName = lastAgentMsg.agentName;
+            _currentSpeakingThemeColor = hexToColor(lastAgentMsg.themeColor);
+            _showAvatar = true;
+            _avatarAnimController.forward();
+          }
         });
         _scrollToBottom();
       }
@@ -133,68 +204,90 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() {
       _isLoading = true;
       _messages.clear();
+      _showAvatar = false;
     });
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('🔄 デモ環境を完全に初期化しています...（少し時間がかかります）')),
-    );
+    _avatarAnimController.reset();
 
     try {
-      // 修正: baseUrlを利用
-      final response = await http.post(
-        Uri.parse('$baseUrl/api/v1/reset'),
-      );
-
+      final response = await http.post(Uri.parse('$baseUrl/api/v1/reset'));
       if (response.statusCode == 200) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('✨ 初期化が完了しました！')),
-        );
         await _fetchHistory(_currentUserId);
-      } else {
-        throw Exception('リセットに失敗しました');
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('🚨 エラーが発生しました: $e')),
-      );
+      print('リセットエラー: $e');
     } finally {
-      setState(() {
-        _isLoading = false;
-      });
+      setState(() => _isLoading = false);
     }
   }
 
-  void _listen() async {
+void _listen() async {
     if (!_isListening) {
+      // 💡 新しくマイク入力を開始するときはテキストをクリアして聞き取り開始
+      _controller.clear();
+
       bool available = await _speech.initialize(
-        onStatus: (val) => print('onStatus: $val'),
-        onError: (val) => print('onError: $val'),
+        onStatus: (status) {
+          if (status == 'done' || status == 'notListening') {
+            if (mounted && _isListening) {
+              setState(() => _isListening = false);
+              // 💡 音声対話モードなら無音検知で自動送信
+              if (_isVoiceOnlyMode && _controller.text.trim().isNotEmpty) {
+                _sendMessage();
+              }
+            }
+          }
+        },
+        onError: (errorNotification) {
+          print('音声認識エラー: $errorNotification');
+          if (mounted) {
+            setState(() => _isListening = false);
+          }
+        },
       );
+
       if (available) {
         setState(() => _isListening = true);
-        _speech.listen(
-          onResult: (val) => setState(() {
-            _controller.text = val.recognizedWords;
-          }),
+        await _speech.listen(
+          onResult: (result) {
+            // 💡 マイクがOFFになった後は上書きしない
+            if (!_isListening) return;
+
+            setState(() {
+              _controller.value = TextEditingValue(
+                text: result.recognizedWords,
+                selection: TextSelection.collapsed(offset: result.recognizedWords.length),
+              );
+            });
+          },
           localeId: 'ja_JP',
+          listenMode: stt.ListenMode.dictation,
+          cancelOnError: true,
+          partialResults: true,
         );
       }
     } else {
+      // 💡 ユーザーがマイクボタンをタップして手動でOFFにしたとき
+      await _speech.stop();
       setState(() => _isListening = false);
-      _speech.stop();
+
+      if (_isVoiceOnlyMode) {
+        // 💡 音声対話モード：マイクOFF ＝ そのままメッセージ送信
+        if (_controller.text.trim().isNotEmpty) {
+          _sendMessage();
+        }
+      } else {
+        // 💡 テキストモード：話したテキストは残す（クリアしない）
+        // そのままテキストボックスに残るので、ユーザーが確認・修正して送信ボタンを押せます
+      }
     }
   }
 
   Future<void> _pickImage() async {
     final XFile? image = await _picker.pickImage(source: ImageSource.gallery);
-    if (image != null) {
-      setState(() => _selectedImage = image);
-    }
+    if (image != null) setState(() => _selectedImage = image);
   }
 
-  void _clearImage() {
-    setState(() => _selectedImage = null);
-  }
+  void _clearImage() => setState(() => _selectedImage = null);
 
   Color _getAgentBgColor(String? agentId) {
     switch (agentId) {
@@ -243,37 +336,47 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.isEmpty && _selectedImage == null) return;
     if (_isLoading) return;
 
-    await _audioPlayer.stop();
-    
+    // 💡 1. 音声認識が動いている場合は同期的に停止（遅延コールバックによるテキスト再代入を遮断）
     if (_isListening) {
-      _speech.stop();
+      await _speech.stop();
       setState(() => _isListening = false);
     }
 
-    setState(() => _isLoading = true);
+    // 💡 2. 音声再生を停止
+    await _audioPlayer.stop();
+
+    // 💡 3. 音声認識を完全に止めた後にテキストフィールドを即座に完全クリア
+    _controller.value = TextEditingValue.empty;
+    _controller.clear();
+
+    // 💡 4. 送信時に現在のアバターを退場アニメーションさせる
+    _avatarAnimController.reverse();
+
+    setState(() {
+      _isLoading = true;
+      _showAvatar = false;
+    });
 
     String imageUrl = '';
     String displayMessage = text;
 
+    // 画像が選択されている場合のアップロード処理
     if (_selectedImage != null) {
       try {
         displayMessage = text.isEmpty ? '[画像を送信しました]' : '[画像を送信しました]\n$text';
         final imageToUpload = _selectedImage!;
         setState(() {
           _messages.add(Message(text: displayMessage, role: 'user'));
-          _selectedImage = null; 
+          _selectedImage = null;
         });
         _scrollToBottom();
 
-        // 修正: baseUrlを利用
         final uploadUrl = Uri.parse('$baseUrl/api/v1/upload');
         var request = http.MultipartRequest('POST', uploadUrl);
         final bytes = await imageToUpload.readAsBytes();
         request.files.add(http.MultipartFile.fromBytes('file', bytes, filename: imageToUpload.name));
-        
         var streamedResponse = await request.send();
         var response = await http.Response.fromStream(streamedResponse);
-        
         if (response.statusCode == 200) {
           final data = jsonDecode(response.body);
           imageUrl = data['url'];
@@ -288,11 +391,10 @@ class _ChatScreenState extends State<ChatScreen> {
         return;
       }
     } else {
+      // 通常のテキストメッセージをタイムラインに追加
       setState(() => _messages.add(Message(text: text, role: 'user')));
       _scrollToBottom();
     }
-
-    _controller.clear();
 
     String prompt = text;
     if (imageUrl.isNotEmpty) {
@@ -300,7 +402,6 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     try {
-      // 修正: baseUrlを利用
       final url = Uri.parse('$baseUrl/api/v1/chat');
       final response = await http.post(
         url,
@@ -315,33 +416,45 @@ class _ChatScreenState extends State<ChatScreen> {
         final data = jsonDecode(utf8.decode(response.bodyBytes));
         final responseMessage = data['response_message'] ?? '';
         final voiceName = data['voice_name'] ?? 'ja-JP-Neural2-B';
-        
+        final avatarUrl = data['avatar_url'];
+        final agentName = data['agent_name'] ?? 'AIアシスタント';
+        final themeColorHex = data['theme_color'];
+
         setState(() {
           _messages.add(Message(
             text: responseMessage,
             role: 'agent',
             agentId: data['agent_id'] ?? 'default',
-            agentName: data['agent_name'] ?? 'AIアシスタント',
-            themeColor: data['theme_color'],
+            agentName: agentName,
+            themeColor: themeColorHex,
+            avatarUrl: avatarUrl,
           ));
+
+          // 💡 新しいアバター情報をセットして登場準備
+          if (avatarUrl != null && avatarUrl.toString().isNotEmpty) {
+            _currentSpeakingAvatarUrl = avatarUrl;
+            _currentSpeakingAgentName = agentName;
+            _currentSpeakingThemeColor = hexToColor(themeColorHex);
+            _showAvatar = true;
+          }
         });
 
+        // 💡 新しいアバターをバウンスアニメーションで登場
+        if (_showAvatar) {
+          _avatarAnimController.forward(from: 0.0);
+        }
+
+        // 音声読み上げ（TTS）再生
         if (_isTtsEnabled) {
           final cleanText = responseMessage.replaceAll(RegExp(r'[#*`_]'), '');
-          // 修正: baseUrlを利用
           final ttsResponse = await http.post(
             Uri.parse('$baseUrl/api/v1/tts'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'text': cleanText,
-              'voice_name': voiceName,
-            }),
+            body: jsonEncode({'text': cleanText, 'voice_name': voiceName}),
           );
-
           if (ttsResponse.statusCode == 200) {
             final ttsData = jsonDecode(ttsResponse.body);
-            final audioUrl = ttsData['audio_url'];
-            await _audioPlayer.play(UrlSource(audioUrl));
+            await _audioPlayer.play(UrlSource(ttsData['audio_url']));
           }
         }
       } else {
@@ -353,6 +466,34 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() => _isLoading = false);
       _scrollToBottom();
     }
+  }
+
+  Widget _buildAvatarIcon({required String? avatarUrl, required String? agentId, required Color accentColor, double radius = 20}) {
+    final hasAvatar = avatarUrl != null && avatarUrl.isNotEmpty;
+
+    return Container(
+      width: radius * 2,
+      height: radius * 2,
+      decoration: const BoxDecoration(
+        shape: BoxShape.circle,
+        color: Colors.white,
+        boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 2, offset: Offset(0, 1))],
+      ),
+      child: ClipOval(
+        child: hasAvatar
+            ? Transform.scale(
+                scale: 2.2,
+                alignment: const Alignment(0.0, -0.65),
+                child: Image.network(
+                  avatarUrl,
+                  fit: BoxFit.cover,
+                  errorBuilder: (context, error, stackTrace) =>
+                      Center(child: Icon(_getAgentIcon(agentId), color: accentColor, size: radius)),
+                ),
+              )
+            : Center(child: Icon(_getAgentIcon(agentId), color: accentColor, size: radius)),
+      ),
+    );
   }
 
   Widget _buildMessageBubble(Message message) {
@@ -386,23 +527,24 @@ class _ChatScreenState extends State<ChatScreen> {
       return Container(
         width: double.infinity,
         color: bgColor,
-        padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
+        padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 16),
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            CircleAvatar(
-              backgroundColor: Colors.white,
-              radius: 18,
-              child: Icon(_getAgentIcon(message.agentId), color: accentColor, size: 20),
+            _buildAvatarIcon(
+              avatarUrl: message.avatarUrl,
+              agentId: message.agentId,
+              accentColor: accentColor,
+              radius: 20,
             ),
-            const SizedBox(width: 16),
+            const SizedBox(width: 14),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
                     message.agentName ?? _getFallbackAgentName(message.agentId),
-                    style: TextStyle(fontWeight: FontWeight.bold, color: accentColor, fontSize: 13),
+                    style: TextStyle(fontWeight: FontWeight.bold, color: accentColor, fontSize: 14),
                   ),
                   const SizedBox(height: 8),
                   MarkdownBody(
@@ -510,8 +652,237 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  // 💡 ダイナミックな音声特化UIモード
+  Widget _buildVoiceOnlyView() {
+    final hasAvatar = _currentSpeakingAvatarUrl != null && _currentSpeakingAvatarUrl!.isNotEmpty;
+    final agentName = _currentSpeakingAgentName ?? '担当エージェント';
+    final themeColor = _currentSpeakingThemeColor ?? const Color(0xFFCE93D8);
+
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            themeColor.withOpacity(0.12),
+            Colors.white,
+          ],
+        ),
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const SizedBox(height: 20),
+          // ステータステキスト
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 300),
+            child: Container(
+              key: ValueKey<String>('$_isLoading$_isPlayingAudio$_isListening'),
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+              decoration: BoxDecoration(
+                color: themeColor.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Text(
+                _isLoading
+                    ? '⚡ エージェントが思考中...'
+                    : (_isPlayingAudio
+                        ? '🗣️ $agentName が回答中'
+                        : (_isListening ? '🎙️ お話しください...' : '$agentName に話しかけてみましょう')),
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                  color: getDarkerColor(themeColor),
+                  letterSpacing: 0.8,
+                ),
+              ),
+            ),
+          ),
+          const Spacer(),
+
+          // 💡 メインビジュアル部：3重波紋 ＋ トークモーション
+          Center(
+            child: SizedBox(
+              width: 320,
+              height: 380,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  // 1. 同心円状の音波リップル（音声再生中に3重で広がる）
+                  if (_isPlayingAudio) ...[
+                    AnimatedBuilder(
+                      animation: _pulseController,
+                      builder: (context, child) {
+                        return Container(
+                          width: 260 + (_pulseController.value * 70),
+                          height: 320 + (_pulseController.value * 70),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(36),
+                            border: Border.all(
+                              color: themeColor.withOpacity((1.0 - _pulseController.value) * 0.4),
+                              width: 3,
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                    AnimatedBuilder(
+                      animation: _pulseController,
+                      builder: (context, child) {
+                        final val = (_pulseController.value + 0.5) % 1.0;
+                        return Container(
+                          width: 250 + (val * 50),
+                          height: 310 + (val * 50),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(32),
+                            border: Border.all(
+                              color: themeColor.withOpacity((1.0 - val) * 0.3),
+                              width: 2,
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ],
+
+                  // 2. キャラクター本体（発話中のブリージング＆バウンス）
+                  AnimatedBuilder(
+                    animation: _pulseController,
+                    builder: (context, child) {
+                      // 発話中は微かにバウンド＆スケール
+                      final bounce = _isPlayingAudio ? sin(_pulseController.value * pi) * 6.0 : 0.0;
+                      final scale = _isPlayingAudio ? 1.0 + (_pulseController.value * 0.03) : 1.0;
+
+                      return Transform.translate(
+                        offset: Offset(0, -bounce),
+                        child: Transform.scale(
+                          scale: scale,
+                          child: Container(
+                            height: 340,
+                            constraints: const BoxConstraints(maxWidth: 260),
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(24),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: themeColor.withOpacity(_isPlayingAudio ? 0.45 : 0.15),
+                                  blurRadius: _isPlayingAudio ? 30 : 16,
+                                  spreadRadius: _isPlayingAudio ? 6 : 2,
+                                  offset: const Offset(0, 8),
+                                ),
+                              ],
+                            ),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(24),
+                              child: hasAvatar
+                                  ? Image.network(
+                                      _currentSpeakingAvatarUrl!,
+                                      fit: BoxFit.contain,
+                                    )
+                                  : Center(
+                                      child: Icon(Icons.account_circle, size: 120, color: Colors.grey.shade400),
+                                    ),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // 3. 音声再生中のイコライザーバー演出
+          if (_isPlayingAudio)
+            Padding(
+              padding: const EdgeInsets.only(top: 12.0),
+              child: AnimatedBuilder(
+                animation: _pulseController,
+                builder: (context, child) {
+                  return Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: List.generate(5, (index) {
+                      final wave = sin((_pulseController.value * 2 * pi) + (index * 0.8)).abs();
+                      return Container(
+                        margin: const EdgeInsets.symmetric(horizontal: 3),
+                        width: 4,
+                        height: 8 + (wave * 20),
+                        decoration: BoxDecoration(
+                          color: getDarkerColor(themeColor).withOpacity(0.7),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                      );
+                    }),
+                  );
+                },
+              ),
+            ),
+
+          const Spacer(),
+
+          // 音声認識中プレビュー
+          if (_controller.text.isNotEmpty && _isListening)
+            Container(
+              margin: const EdgeInsets.symmetric(horizontal: 36.0, vertical: 8.0),
+              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 10.0),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.9),
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 8)],
+              ),
+              child: Text(
+                _controller.text,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 15, color: Colors.black87, fontWeight: FontWeight.w500),
+              ),
+            ),
+
+          // 4. マイクボタン
+          Padding(
+            padding: const EdgeInsets.only(bottom: 48.0),
+            child: GestureDetector(
+              onTap: _isLoading ? null : _listen,
+              child: AnimatedBuilder(
+                animation: _pulseController,
+                builder: (context, child) {
+                  final scale = _isListening ? 1.0 + (_pulseController.value * 0.12) : 1.0;
+                  return Transform.scale(
+                    scale: scale,
+                    child: Container(
+                      width: 84,
+                      height: 84,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: _isListening ? Colors.redAccent : Colors.black87,
+                        boxShadow: [
+                          BoxShadow(
+                            color: (_isListening ? Colors.redAccent : Colors.black).withOpacity(0.35),
+                            blurRadius: 20,
+                            offset: const Offset(0, 8),
+                          ),
+                        ],
+                      ),
+                      child: Icon(
+                        _isListening ? Icons.mic : Icons.mic_none,
+                        color: Colors.white,
+                        size: 40,
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final themeColor = _currentSpeakingThemeColor ?? const Color(0xFFF3E5F5);
+
     return Scaffold(
       appBar: AppBar(
         title: const Row(
@@ -522,7 +893,6 @@ class _ChatScreenState extends State<ChatScreen> {
             Text('Kaleido', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 22, letterSpacing: 1.2)),
           ],
         ),
-        centerTitle: false,
         backgroundColor: Colors.white,
         foregroundColor: Colors.black87,
         elevation: 0,
@@ -535,7 +905,7 @@ class _ChatScreenState extends State<ChatScreen> {
               style: OutlinedButton.styleFrom(
                 foregroundColor: Colors.red.shade400,
                 side: BorderSide(color: Colors.red.shade400),
-                padding: const EdgeInsets.symmetric(horizontal: 12),
+                padding: const EdgeInsets.symmetric(horizontal: 10),
               ),
               onPressed: () {
                 showDialog(
@@ -544,10 +914,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     title: const Text('環境の初期化'),
                     content: const Text('すべてのチャット履歴と生成されたエージェントを削除し、初期状態に戻しますか？'),
                     actions: [
-                      TextButton(
-                        onPressed: () => Navigator.pop(context),
-                        child: const Text('キャンセル'),
-                      ),
+                      TextButton(onPressed: () => Navigator.pop(context), child: const Text('キャンセル')),
                       ElevatedButton(
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.red.shade400,
@@ -566,7 +933,7 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ),
           Padding(
-            padding: const EdgeInsets.only(right: 8.0, left: 4.0),
+            padding: const EdgeInsets.only(right: 4.0, left: 4.0),
             child: DropdownButton<String>(
               value: _currentUserId,
               icon: const Icon(Icons.person_outline, color: Colors.black87, size: 20),
@@ -574,9 +941,7 @@ class _ChatScreenState extends State<ChatScreen> {
               style: const TextStyle(color: Colors.black87, fontSize: 13, fontWeight: FontWeight.bold),
               onChanged: (String? newValue) {
                 if (newValue != null && newValue != _currentUserId) {
-                  setState(() {
-                    _currentUserId = newValue;
-                  });
+                  setState(() => _currentUserId = newValue);
                   _audioPlayer.stop();
                   _fetchHistory(newValue);
                 }
@@ -587,6 +952,27 @@ class _ChatScreenState extends State<ChatScreen> {
               ],
             ),
           ),
+          // 💡 音声対話特化モードの切り替えボタン
+          IconButton(
+            icon: Icon(
+              _isVoiceOnlyMode ? Icons.chat_bubble_outline : Icons.headphones,
+              color: _isVoiceOnlyMode ? Colors.purple : Colors.black87,
+            ),
+            tooltip: _isVoiceOnlyMode ? 'テキストチャットモードに切替' : '音声対話モードに切替',
+            onPressed: () {
+              // 💡 切り替え時にマイクが動いていれば停止
+              if (_isListening) {
+                _speech.stop();
+              }
+              // 💡 入力中のテキストフィールドを完全にクリア
+              _controller.clear();
+
+              setState(() {
+                _isVoiceOnlyMode = !_isVoiceOnlyMode;
+                _isListening = false;
+              });
+            },
+          ),
           IconButton(
             icon: Icon(
               _isTtsEnabled ? Icons.volume_up : Icons.volume_off,
@@ -594,12 +980,8 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
             tooltip: _isTtsEnabled ? '音声読み上げ: オン' : '音声読み上げ: オフ',
             onPressed: () {
-              setState(() {
-                _isTtsEnabled = !_isTtsEnabled;
-              });
-              if (!_isTtsEnabled) {
-                _audioPlayer.stop(); 
-              }
+              setState(() => _isTtsEnabled = !_isTtsEnabled);
+              if (!_isTtsEnabled) _audioPlayer.stop();
             },
           ),
           IconButton(
@@ -615,30 +997,80 @@ class _ChatScreenState extends State<ChatScreen> {
           const SizedBox(width: 8),
         ],
       ),
-      body: Column(
-        children: [
-          Expanded(
-            child: ListView.builder(
-              controller: _scrollController,
-              itemCount: _messages.length,
-              itemBuilder: (context, index) => _buildMessageBubble(_messages[index]),
+      body: _isVoiceOnlyMode
+          ? _buildVoiceOnlyView()
+          : Stack(
+              children: [
+                Column(
+                  children: [
+                    Expanded(
+                      child: ListView.builder(
+                        controller: _scrollController,
+                        itemCount: _messages.length,
+                        itemBuilder: (context, index) => _buildMessageBubble(_messages[index]),
+                      ),
+                    ),
+                    if (_isLoading)
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 12.0),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                            SizedBox(width: 12),
+                            Text('エージェントが思考中...', style: TextStyle(color: Colors.grey, fontSize: 13)),
+                          ],
+                        ),
+                      ),
+                    _buildMessageInput(),
+                  ],
+                ),
+                if (_currentSpeakingAvatarUrl != null)
+                  Positioned(
+                    top: 16,
+                    right: 16,
+                    child: IgnorePointer(
+                      child: SlideTransition(
+                        position: _slideAnimation,
+                        child: ScaleTransition(
+                          scale: _scaleAnimation,
+                          child: AnimatedBuilder(
+                            animation: _pulseController,
+                            builder: (context, child) {
+                              final glowIntensity = _isPlayingAudio ? _pulseController.value : 0.0;
+                              return Container(
+                                height: 230,
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(16),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: themeColor.withOpacity(0.25 + (glowIntensity * 0.4)),
+                                      blurRadius: 18 + (glowIntensity * 14),
+                                      spreadRadius: 2 + (glowIntensity * 4),
+                                    ),
+                                    BoxShadow(
+                                      color: Colors.black.withOpacity(0.12),
+                                      blurRadius: 14,
+                                      offset: const Offset(0, 4),
+                                    ),
+                                  ],
+                                ),
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(16),
+                                  child: Image.network(
+                                    _currentSpeakingAvatarUrl!,
+                                    fit: BoxFit.contain,
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
             ),
-          ),
-          if (_isLoading)
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 12.0),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
-                  SizedBox(width: 12),
-                  Text('エージェントが思考中...', style: TextStyle(color: Colors.grey, fontSize: 13)),
-                ],
-              ),
-            ),
-          _buildMessageInput(),
-        ],
-      ),
     );
   }
 }
@@ -648,20 +1080,23 @@ class AgentInfo {
   final String name;
   final String description;
   final String themeColor;
+  final String? avatarUrl;
 
   AgentInfo({
     required this.id,
     required this.name,
     required this.description,
     required this.themeColor,
+    this.avatarUrl,
   });
 
   factory AgentInfo.fromJson(Map<String, dynamic> json) {
     return AgentInfo(
-      id: json['id'] ?? '',
+      id: json['id'] ?? json['agent_id'] ?? '',
       name: json['name'] ?? '名称未設定',
       description: json['description'] ?? '',
       themeColor: json['theme_color'] ?? '#F3E5F5',
+      avatarUrl: json['avatar_url'],
     );
   }
 }
@@ -688,42 +1123,32 @@ class _AgentsScreenState extends State<AgentsScreen> {
 
   Future<void> _fetchAgents() async {
     try {
-      // 修正: baseUrlを利用
       final response = await http.get(Uri.parse('$baseUrl/api/v1/agents?user_id=${widget.userId}'));
+      List<AgentInfo> fetchedAgents = [];
       if (response.statusCode == 200) {
         final data = jsonDecode(utf8.decode(response.bodyBytes));
         final List<dynamic> list = data['agents'] ?? [];
-        
-        List<AgentInfo> fetchedAgents = list.map((e) => AgentInfo.fromJson(e)).toList();
-        
-        final existingIds = fetchedAgents.map((e) => e.id).toSet();
-        
-        for (var msg in widget.chatMessages) {
-          if (msg.role == 'agent' && msg.agentId != null && msg.agentId != 'default' && msg.agentId != 'parse_error') {
-            if (!existingIds.contains(msg.agentId)) {
-               String fallbackName = 'AIアシスタント';
-               String fallbackColor = '#F3E5F5';
-               if (msg.agentId == 'travel_planner_01') { fallbackName = '駅すぱあと経路検索エージェント'; fallbackColor = '#E0F7FA'; }
-               if (msg.agentId == 'beauty_analyst_01') { fallbackName = 'YouCam肌分析エージェント'; fallbackColor = '#FCE4EC'; }
-               
-               fetchedAgents.add(AgentInfo(
-                 id: msg.agentId!,
-                 name: msg.agentName ?? fallbackName,
-                 description: '過去のチャットでサポートした専門家',
-                 themeColor: msg.themeColor ?? fallbackColor,
-               ));
-               existingIds.add(msg.agentId!);
-            }
-          }
-        }
-
-        setState(() {
-          _agents = fetchedAgents;
-          _isLoading = false;
-        });
-      } else {
-        setState(() => _isLoading = false);
+        fetchedAgents = list.map((e) => AgentInfo.fromJson(e)).toList();
       }
+
+      final existingIds = fetchedAgents.map((e) => e.id).toSet();
+      for (var msg in widget.chatMessages) {
+        if (msg.role == 'agent' && msg.agentId != null && !existingIds.contains(msg.agentId)) {
+          fetchedAgents.add(AgentInfo(
+            id: msg.agentId!,
+            name: msg.agentName ?? 'AIアシスタント',
+            description: '会話ログにある専門家',
+            themeColor: msg.themeColor ?? '#F3E5F5',
+            avatarUrl: msg.avatarUrl,
+          ));
+          existingIds.add(msg.agentId!);
+        }
+      }
+
+      setState(() {
+        _agents = fetchedAgents;
+        _isLoading = false;
+      });
     } catch (e) {
       setState(() => _isLoading = false);
     }
@@ -744,122 +1169,105 @@ class _AgentsScreenState extends State<AgentsScreen> {
               children: [
                 Expanded(
                   flex: 3,
-                  child: Container(
-                    width: double.infinity,
-                    color: const Color(0xFFFAFAFA),
-                    child: LayoutBuilder(
-                      builder: (context, constraints) {
-                        final width = constraints.maxWidth;
-                        final height = constraints.maxHeight;
-                        final center = Offset(width / 2, height / 2);
-                        final radius = min(width, height) * 0.35;
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final width = constraints.maxWidth;
+                      final height = constraints.maxHeight;
+                      final center = Offset(width / 2, height / 2);
+                      final radius = min(width, height) * 0.35;
 
-                        return Stack(
-                          children: [
-                            CustomPaint(
-                              size: Size(width, height),
-                              painter: LinesPainter(
-                                count: _agents.length,
-                                center: center,
-                                radius: radius,
-                              ),
+                      return Stack(
+                        children: [
+                          CustomPaint(
+                            size: Size(width, height),
+                            painter: LinesPainter(count: _agents.length, center: center, radius: radius),
+                          ),
+                          Positioned(
+                            left: center.dx - 30,
+                            top: center.dy - 30,
+                            child: CircleAvatar(
+                              radius: 26,
+                              backgroundColor: Colors.black87,
+                              child: const Icon(Icons.person, color: Colors.white, size: 28),
                             ),
-                            Positioned(
-                              left: center.dx - 35,
-                              top: center.dy - 35,
+                          ),
+                          ...List.generate(_agents.length, (index) {
+                            final agent = _agents[index];
+                            final angle = (2 * pi * index) / max(_agents.length, 1) - (pi / 2);
+                            final x = center.dx + radius * cos(angle);
+                            final y = center.dy + radius * sin(angle);
+                            final hasAvatar = agent.avatarUrl != null && agent.avatarUrl!.isNotEmpty;
+
+                            return Positioned(
+                              left: x - 35,
+                              top: y - 35,
+                              width: 70,
                               child: Column(
+                                mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  CircleAvatar(
-                                    radius: 26,
-                                    backgroundColor: widget.userId == 'user_a' ? Colors.black87 : Colors.indigo,
-                                    child: const Icon(Icons.person, color: Colors.white, size: 28),
+                                  Container(
+                                    width: 44,
+                                    height: 44,
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      color: hexToColor(agent.themeColor),
+                                      boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 4)],
+                                    ),
+                                    child: ClipOval(
+                                      child: hasAvatar
+                                          ? Transform.scale(
+                                              scale: 2.2,
+                                              alignment: const Alignment(0.0, -0.65),
+                                              child: Image.network(agent.avatarUrl!, fit: BoxFit.cover),
+                                            )
+                                          : const Icon(Icons.auto_awesome, color: Colors.black54, size: 20),
+                                    ),
                                   ),
                                   const SizedBox(height: 4),
-                                  Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                                    decoration: BoxDecoration(
-                                      color: widget.userId == 'user_a' ? Colors.black87 : Colors.indigo, 
-                                      borderRadius: BorderRadius.circular(12)
-                                    ),
-                                    child: Text(
-                                      widget.userId == 'user_a' ? 'User A' : 'User B',
-                                      style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold)
-                                    ),
+                                  Text(
+                                    agent.name,
+                                    textAlign: TextAlign.center,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold),
                                   ),
                                 ],
                               ),
-                            ),
-                            ...List.generate(_agents.length, (index) {
-                              final agent = _agents[index];
-                              final angle = (2 * pi * index) / _agents.length - (pi / 2); 
-                              final x = center.dx + radius * cos(angle);
-                              final y = center.dy + radius * sin(angle);
-                              
-                              final bgColor = hexToColor(agent.themeColor);
-                              final accentColor = getDarkerColor(bgColor);
-
-                              return Positioned(
-                                left: x - 40,
-                                top: y - 40,
-                                width: 80,
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    CircleAvatar(
-                                      radius: 22,
-                                      backgroundColor: bgColor.withOpacity(0.9),
-                                      child: Icon(Icons.auto_awesome, color: accentColor, size: 20),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      agent.name,
-                                      textAlign: TextAlign.center,
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: accentColor),
-                                    ),
-                                  ],
-                                ),
-                              );
-                            }),
-                          ],
-                        );
-                      },
-                    ),
+                            );
+                          }),
+                        ],
+                      );
+                    },
                   ),
                 ),
-                const Divider(height: 1, color: Colors.black12),
+                const Divider(height: 1),
                 Expanded(
                   flex: 2,
-                  child: Container(
-                    color: Colors.white,
-                    child: ListView.builder(
-                      itemCount: _agents.length,
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      itemBuilder: (context, index) {
-                        final agent = _agents[index];
-                        final bgColor = hexToColor(agent.themeColor);
-                        final accentColor = getDarkerColor(bgColor);
-                        
-                        return Card(
-                          margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-                          elevation: 0,
-                          color: bgColor.withOpacity(0.3),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12),
-                            side: BorderSide(color: bgColor.withOpacity(0.6)),
+                  child: ListView.builder(
+                    itemCount: _agents.length,
+                    itemBuilder: (context, index) {
+                      final agent = _agents[index];
+                      final hasAvatar = agent.avatarUrl != null && agent.avatarUrl!.isNotEmpty;
+
+                      return ListTile(
+                        leading: Container(
+                          width: 40,
+                          height: 40,
+                          decoration: const BoxDecoration(shape: BoxShape.circle, color: Colors.white),
+                          child: ClipOval(
+                            child: hasAvatar
+                                ? Transform.scale(
+                                    scale: 2.2,
+                                    alignment: const Alignment(0.0, -0.65),
+                                    child: Image.network(agent.avatarUrl!, fit: BoxFit.cover),
+                                  )
+                                : const Icon(Icons.auto_awesome, color: Colors.grey),
                           ),
-                          child: ListTile(
-                            leading: CircleAvatar(
-                              backgroundColor: Colors.white,
-                              child: Icon(Icons.auto_awesome, color: accentColor),
-                            ),
-                            title: Text(agent.name, style: TextStyle(fontWeight: FontWeight.bold, color: accentColor, fontSize: 14)),
-                            subtitle: Text(agent.description, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12, color: Colors.black87)),
-                          ),
-                        );
-                      },
-                    ),
+                        ),
+                        title: Text(agent.name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                        subtitle: Text(agent.description, maxLines: 1, overflow: TextOverflow.ellipsis),
+                      );
+                    },
                   ),
                 ),
               ],

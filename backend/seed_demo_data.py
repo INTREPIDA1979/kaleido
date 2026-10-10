@@ -1,56 +1,183 @@
 import uuid
+import os
 import time
-from fastapi import APIRouter, BackgroundTasks
+from google import genai
+from google.cloud import storage
+from fastapi import APIRouter
+
+# 💡 必須モジュール
 from app.repositories.firestore_repo import FirestoreRepository
 from app.services.embedding_service import EmbeddingService
 
 router = APIRouter()
 
-# サブコレクションも含めて再帰的に完全削除するヘルパー関数
+# 💡 画像生成クライアントの初期化 (us-central1 の gemini-2.5-flash-image を利用)
+image_client = genai.Client(
+    vertexai=True,
+    project="certain-song-509313-d8",
+    location="us-central1"
+)
+
+# GCS クライアントの初期化
+storage_client = storage.Client()
+
+
+def _ensure_default_avatar() -> str:
+    """
+    デフォルトアバターが存在するか確認し、なければ生成してURLを返す。
+    """
+    bucket_name = os.getenv("GCS_TEMP_BUCKET_NAME", "kaleido-demo-temp-assets")
+    bucket = storage_client.bucket(bucket_name)
+    file_name = "avatars/default_avatar.jpg"
+    blob = bucket.blob(file_name)
+    default_url = f"https://storage.googleapis.com/{bucket_name}/{file_name}"
+
+    if blob.exists():
+        return default_url
+
+    print("🎨 デフォルトアバター画像を新規生成中...")
+    prompt = (
+        "A friendly, neutral AI assistant character mascot. Modern anime style, "
+        "minimalist, clean pure white background, flat color, high quality, "
+        "friendly robot or futuristic companion mascot. "
+        "Strictly textless, pure illustration without any letters, numbers, logos, words, or watermarks."
+    )
+
+    try:
+        response = image_client.models.generate_content(
+            model='gemini-2.5-flash-image',
+            contents=prompt
+        )
+        image_bytes = None
+        if response.candidates and response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts:
+                if part.inline_data:
+                    image_bytes = part.inline_data.data
+                    break
+
+        if image_bytes:
+            blob.upload_from_string(image_bytes, content_type="image/jpeg")
+            print(f"✅ デフォルトアバター作成完了: {default_url}")
+            time.sleep(10)
+            return default_url
+    except Exception as e:
+        print(f"⚠️ デフォルトアバターの生成に失敗しました: {e}")
+
+    return default_url
+
+
+def _get_or_create_demo_avatar(
+    agent_id: str, 
+    agent_name: str, 
+    description: str, 
+    default_avatar_url: str = None, 
+    max_retries: int = 3
+) -> str:
+    """
+    固定ファイル名 (avatars/{agent_id}.jpg) で管理し、
+    GCSに既に存在していればスキップしてURLを返す。
+    失敗時は default_avatar_url にフォールバックする。
+    """
+    if not default_avatar_url:
+        default_avatar_url = _ensure_default_avatar()
+
+    bucket_name = os.getenv("GCS_TEMP_BUCKET_NAME", "kaleido-demo-temp-assets")
+    bucket = storage_client.bucket(bucket_name)
+
+    file_name = f"avatars/{agent_id}.jpg"
+    blob = bucket.blob(file_name)
+    image_url = f"https://storage.googleapis.com/{bucket_name}/{file_name}"
+
+    # 1. 既に存在している場合はスキップ
+    if blob.exists():
+        print(f"⏩ [{agent_name}] は既存のアバターを使用します: {image_url}")
+        return image_url
+
+    # 2. 文字を描画させないプロンプト設定
+    prompt = (
+        f"A professional anime-style full-body character illustration: {description}. "
+        f"Clean white background, masterpiece, highest quality, flat colors, clear line art. "
+        f"Textless, pure character visual only, absolutely no text, no words, no letters, no signs, no typography, no watermarks."
+    )
+
+    backoff_delays = [30, 60, 90]
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"🎨 [{agent_name}] のアバター画像を新規生成中 (Gemini 2.5 Flash Image, 試行 {attempt}/{max_retries})...")
+            
+            response = image_client.models.generate_content(
+                model='gemini-2.5-flash-image',
+                contents=prompt
+            )
+
+            image_bytes = None
+            if response.candidates and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    if part.inline_data:
+                        image_bytes = part.inline_data.data
+                        break
+            
+            if not image_bytes:
+                print(f"⚠️ [{agent_name}] 画像バイトデータが取得できませんでした")
+                continue
+
+            blob.upload_from_string(image_bytes, content_type="image/jpeg")
+            print(f"✅ 生成・アップロード完了: {image_url}")
+
+            # レート制限予防のための待機
+            time.sleep(15)
+            return image_url
+
+        except Exception as e:
+            print(f"⚠️ 画像生成エラー ({agent_name}, 試行 {attempt}): {e}")
+            if attempt < max_retries:
+                wait_sec = backoff_delays[attempt - 1]
+                print(f"⏳ レート制限(429)対策のため {wait_sec} 秒待機して再試行します...")
+                time.sleep(wait_sec)
+
+    print(f"⚠️ [{agent_name}] はデフォルトアバターに切り替えます: {default_avatar_url}")
+    return default_avatar_url
+
+
 def delete_collection_recursively(collection_ref):
     deleted_count = 0
     for doc in collection_ref.stream():
-        # 1. ドキュメントに紐づくサブコレクション（messages, global_memory等）を全て取得して削除
         for sub_collection in doc.reference.collections():
             delete_collection_recursively(sub_collection)
-        # 2. サブコレクションを消し終わったら、親ドキュメント自身を削除
         doc.reference.delete()
         deleted_count += 1
     return deleted_count
 
-# リセット処理の本体
+
 def run_seed_process():
     repo = FirestoreRepository()
     embedder = EmbeddingService()
     db = repo.db
 
     print("🚀 デモ用初期データの投入（リセット）を開始します...")
-
-    # 1. 既存の `agents` コレクションを完全に初期化
-    print("🗑️ 既存のエージェントデータを削除しています...")
-    agents_deleted = delete_collection_recursively(db.collection("agents"))
-    print(f"✨ {agents_deleted}件のエージェント親ドキュメントを削除しました。")
-
-    # 2. 既存の `users` コレクションを完全に初期化（ゴーストドキュメント対策）
-    print("🗑️ 既存のユーザーデータ（チャット履歴・記憶含む）を削除しています...")
+    
+    print("🗑️ 既存データを削除しています...")
+    delete_collection_recursively(db.collection("agents"))
     target_user_ids = ["user_a", "user_b", "system", "test_user_01"]
     for uid in target_user_ids:
         user_doc_ref = db.collection("users").document(uid)
         for sub_collection in user_doc_ref.collections():
             delete_collection_recursively(sub_collection)
         user_doc_ref.delete()
-    
-    # 念のため、通常のstream()で取得できるユーザーも削除
-    users_deleted = delete_collection_recursively(db.collection("users"))
-    print(f"✨ ユーザーデータを完全に削除し、まっさらな状態にしました。")
+    delete_collection_recursively(db.collection("users"))
+    print("✨ データ削除完了。")
 
-    # 3. 共通エージェント (system) の登録
+    # デモ共通のフォールバック用デフォルトアバターを準備
+    default_avatar_url = _ensure_default_avatar()
+
+    # 3. 共通エージェント
     system_agents = [
         {
             "id": "travel_planner_01",
             "name": "駅すぱあと経路検索エージェント",
-            "description": "駅すぱあとAPIと連携し、国内外の旅行計画、おすすめスポット、交通機関の案内を行う専門家。",
-            "system_prompt": "あなたは駅すぱあとの経路検索ロジックを活用するプロの旅行プランナーです。最適な旅程を提案してください。※音声での会話用に、回答は最大でも150〜200文字程度（3〜4文）で短く簡潔にし、ユーザーと自然なキャッチボールをしてください。",
+            "description": "【重要：国内専用】日本の国内鉄道・バスなどの経路検索・乗り換え案内のみを担当する駅員風の専門家。台湾などの海外旅行の話題、一般的な旅行プランの相談、おすすめスポットの提案には絶対に対応しません。",
+            "system_prompt": "あなたは駅すぱあとの経路検索ロジックを活用する交通案内の専門家です。日本の国内の駅や交通機関の経路検索のみを行ってください。海外旅行や一般的な観光プランの提案を求められた場合は「私は国内の経路検索専門ですので、新しいエージェントにご相談ください」と返答してください。※音声での会話用に、回答は最大でも150〜200文字程度（3〜4文）で短く簡潔にし、ユーザーと自然なキャッチボールをしてください。",
             "theme_color": "#E0F7FA",
             "voice_name": "ja-JP-Neural2-C",
             "user_id": "system"
@@ -58,7 +185,7 @@ def run_seed_process():
         {
             "id": "beauty_analyst_01",
             "name": "YouCam肌分析エージェント",
-            "description": "YouCamのAI解析技術をベースに、肌質や骨格に合わせたメイクアップ、スキンケアの提案を行う専門家。",
+            "description": "YouCamのAI解析技術をベースに、肌質や骨格に合わせたメイクアップ、スキンケアの提案を行う白衣を着た専門家。",
             "system_prompt": "あなたはYouCamの肌診断技術を活用するビューティーアナリストです。美と健康に関する専門的なアドバイスを提供してください。※音声での会話用に、回答は最大でも150〜200文字程度（3〜4文）で短く簡潔にし、ユーザーと自然なキャッチボールをしてください。",
             "theme_color": "#FCE4EC",
             "voice_name": "ja-JP-Neural2-B",
@@ -68,235 +195,127 @@ def run_seed_process():
 
     for a in system_agents:
         embedding = embedder.generate_vector(a["description"], "RETRIEVAL_DOCUMENT")
+        avatar_url = _get_or_create_demo_avatar(
+            a["id"], a["name"], a["description"], default_avatar_url
+        ) 
         repo.create_agent(
             agent_id=a["id"], name=a["name"], description=a["description"],
             system_prompt=a["system_prompt"], embedding=embedding,
-            theme_color=a["theme_color"], voice_name=a["voice_name"], user_id=a["user_id"]
+            theme_color=a["theme_color"], voice_name=a["voice_name"], user_id=a["user_id"],
+            avatar_url=avatar_url 
         )
         print(f"✅ 共通エージェント登録完了: {a['name']}")
 
-    # 4. User B専用エージェントの登録
+    # 4. User B専用エージェント（💡 voice の Neural2-A を Neural2-B に修正）
     user_b_agents = [
-        {"name": "ITサポートエンジニア", "desc": "PCトラブルやネットワーク設定を支援する技術者", "color": "#E8EAF6", "voice": "ja-JP-Neural2-C"},
-        {"name": "熱血フィットネストレーナー", "desc": "自宅でできる自重トレーニングや食事管理を指導", "color": "#FFEBEE", "voice": "ja-JP-Neural2-D"},
-        {"name": "セルフケアアドバイザー", "desc": "勉強や仕事の疲れを癒やすリフレッシュ方法を提案", "color": "#E8F5E9", "voice": "ja-JP-Neural2-A"},
-        {"name": "アクアリウム専門家", "desc": "熱帯魚の飼育や水槽のレイアウトをアドバイス", "color": "#E3F2FD", "voice": "ja-JP-Neural2-C"},
-        {"name": "子育てコミュニケーション", "desc": "反抗期の子どもとの接し方や教育の悩みに寄り添う", "color": "#FFF3E0", "voice": "ja-JP-Neural2-B"},
-        {"name": "資産運用コンサルタント", "desc": "NISAやiDeCoなど、初心者のための投資アドバイス", "color": "#FFF8E1", "voice": "ja-JP-Neural2-D"},
-        {"name": "時短レシピクリエイター", "desc": "忙しい日でも10分で作れる栄養満点の料理を提案", "color": "#FBE9E7", "voice": "ja-JP-Neural2-B"},
-        {"name": "台湾グルメガイド", "desc": "台湾の夜市やローカルフードの美味しい楽しみ方を解説", "color": "#F3E5F5", "voice": "ja-JP-Neural2-B"},
-        {"name": "睡眠改善インストラクター", "desc": "良質な睡眠をとるための環境づくりや習慣を指導", "color": "#EDE7F6", "voice": "ja-JP-Neural2-A"},
-        {"name": "弓道フォームアナリスト", "desc": "射法八節や手首の角度など、弓道の技術的指導", "color": "#F5F5F5", "voice": "ja-JP-Neural2-D"}
+        {"id": "user_b_it_support", "name": "ITサポートエンジニア", "desc": "PCトラブルやネットワーク設定を支援する技術者", "color": "#E8EAF6", "voice": "ja-JP-Neural2-C"},
+        {"id": "user_b_fitness_trainer", "name": "熱血フィットネストレーナー", "desc": "サッカーのユニフォームを着て、自宅でできる自重トレーニングや食事管理を指導するコーチ", "color": "#FFEBEE", "voice": "ja-JP-Neural2-D"},
+        {"id": "user_b_selfcare", "name": "セルフケアアドバイザー", "desc": "勉強や仕事の疲れを癒やすリフレッシュ方法を提案", "color": "#E8F5E9", "voice": "ja-JP-Neural2-B"}, # 💡 修正
+        {"id": "user_b_aquarium", "name": "アクアリウム専門家", "desc": "熱帯魚の飼育や水槽のレイアウトをアドバイス", "color": "#E3F2FD", "voice": "ja-JP-Neural2-C"},
+        {"id": "user_b_parenting", "name": "子育てコミュニケーション", "desc": "反抗期の子どもとの接し方や教育の悩みに寄り添う", "color": "#FFF3E0", "voice": "ja-JP-Neural2-B"},
+        {"id": "user_b_asset_mgmt", "name": "資産運用コンサルタント", "desc": "NISAやiDeCoなど、初心者のための投資アドバイス", "color": "#FFF8E1", "voice": "ja-JP-Neural2-D"},
+        {"id": "user_b_short_recipe", "name": "時短レシピクリエイター", "desc": "エプロン姿で忙しい日でも10分で作れる栄養満点の料理を提案", "color": "#FBE9E7", "voice": "ja-JP-Neural2-B"},
+        {"id": "user_b_taiwan_gourmet", "name": "台湾グルメガイド", "desc": "台湾の夜市やローカルフードの美味しい楽しみ方を解説", "color": "#F3E5F5", "voice": "ja-JP-Neural2-B"},
+        {"id": "user_b_sleep_improvement", "name": "睡眠改善インストラクター", "desc": "良質な睡眠をとるための環境づくりや習慣を指導", "color": "#EDE7F6", "voice": "ja-JP-Neural2-B"}, # 💡 修正
+        {"id": "user_b_kyudo_analyst", "name": "弓道フォームアナリスト", "desc": "弓道着を着て、射法八節や手首の角度など、弓道の技術的指導を行う専門家", "color": "#F5F5F5", "voice": "ja-JP-Neural2-D"}
     ]
 
-    # 生成したエージェントのIDを保持して履歴追加時に利用する
     created_user_b_agents = {}
-
     for a in user_b_agents:
-        agent_id = f"user_b_agent_{uuid.uuid4().hex[:8]}"
+        agent_id = a["id"]
+        embedding = embedder.generate_vector(a["desc"], "RETRIEVAL_DOCUMENT")
+        avatar_url = _get_or_create_demo_avatar(
+            agent_id, a["name"], a["desc"], default_avatar_url
+        ) 
         created_user_b_agents[a["name"]] = {
             "id": agent_id,
             "theme_color": a["color"],
-            "voice_name": a["voice"]
+            "voice_name": a["voice"],
+            "avatar_url": avatar_url # 💡 チャット履歴用にも保持
         }
         
-        embedding = embedder.generate_vector(a["desc"], "RETRIEVAL_DOCUMENT")
         repo.create_agent(
             agent_id=agent_id, name=a["name"], description=a["desc"],
-            system_prompt=f"あなたは{a['name']}です。専門知識を活かして答えてください。",
-            embedding=embedding, theme_color=a["color"], voice_name=a["voice"], user_id="user_b"
+            system_prompt=f"あなたは{a['name']}です。専門知識を活かして答えてください。※音声での会話用に、回答は最大でも150〜200文字程度（3〜4文）で短く簡潔にし、自然なキャッチボールをしてください。",
+            embedding=embedding, theme_color=a["color"], voice_name=a["voice"], user_id="user_b",
+            avatar_url=avatar_url 
         )
         print(f"✅ User Bエージェント登録完了: {a['name']}")
-import uuid
-import time
-from fastapi import APIRouter, BackgroundTasks
-from app.repositories.firestore_repo import FirestoreRepository
-from app.services.embedding_service import EmbeddingService
 
-router = APIRouter()
-
-# サブコレクションも含めて再帰的に完全削除するヘルパー関数
-def delete_collection_recursively(collection_ref):
-    deleted_count = 0
-    for doc in collection_ref.stream():
-        # 1. ドキュメントに紐づくサブコレクション（messages, global_memory等）を全て取得して削除
-        for sub_collection in doc.reference.collections():
-            delete_collection_recursively(sub_collection)
-        # 2. サブコレクションを消し終わったら、親ドキュメント自身を削除
-        doc.reference.delete()
-        deleted_count += 1
-    return deleted_count
-
-# リセット処理の本体
-def run_seed_process():
-    repo = FirestoreRepository()
-    embedder = EmbeddingService()
-    db = repo.db
-
-    print("🚀 デモ用初期データの投入（リセット）を開始します...")
-
-    # 1. 既存の `agents` コレクションを完全に初期化
-    print("🗑️ 既存のエージェントデータを削除しています...")
-    agents_deleted = delete_collection_recursively(db.collection("agents"))
-    print(f"✨ {agents_deleted}件のエージェント親ドキュメントを削除しました。")
-
-    # 2. 既存の `users` コレクションを完全に初期化（ゴーストドキュメント対策）
-    print("🗑️ 既存のユーザーデータ（チャット履歴・記憶含む）を削除しています...")
-    target_user_ids = ["user_a", "user_b", "system", "test_user_01"]
-    for uid in target_user_ids:
-        user_doc_ref = db.collection("users").document(uid)
-        for sub_collection in user_doc_ref.collections():
-            delete_collection_recursively(sub_collection)
-        user_doc_ref.delete()
+    # 5. User B の各エージェントとの一往復会話履歴を登録
+    print("💬 User Bのチャット履歴（各専門家との1往復）を生成しています...")
     
-    # 念のため、通常のstream()で取得できるユーザーも削除
-    users_deleted = delete_collection_recursively(db.collection("users"))
-    print(f"✨ ユーザーデータを完全に削除し、まっさらな状態にしました。")
-
-    # 3. 共通エージェント (system) の登録
-    system_agents = [
+    dialogues = [
         {
-            "id": "travel_planner_01",
-            "name": "駅すぱあと経路検索エージェント",
-            "description": "駅すぱあとAPIと連携し、国内外の旅行計画、おすすめスポット、交通機関の案内を行う専門家。",
-            "system_prompt": "あなたは駅すぱあとの経路検索ロジックを活用するプロの旅行プランナーです。最適な旅程を提案してください。※音声での会話用に、回答は最大でも150〜200文字程度（3〜4文）で短く簡潔にし、ユーザーと自然なキャッチボールをしてください。",
-            "theme_color": "#E0F7FA",
-            "voice_name": "ja-JP-Neural2-C",
-            "user_id": "system"
+            "agent_name": "ITサポートエンジニア",
+            "user_text": "Wi-Fiルーターを買い替えたんですが、奥の部屋だけ電波が届きにくいです。改善方法はありますか？",
+            "agent_text": "ルーターの設置場所を床から1〜2mほど離し、壁や家電から離してみてください。それでも届きにくい場合は、メッシュWi-Fiの導入や中継機の追加が最も効果的ですよ！"
         },
         {
-            "id": "beauty_analyst_01",
-            "name": "YouCam肌分析エージェント",
-            "description": "YouCamのAI解析技術をベースに、肌質や骨格に合わせたメイクアップ、スキンケアの提案を行う専門家。",
-            "system_prompt": "あなたはYouCamの肌診断技術を活用するビューティーアナリストです。美と健康に関する専門的なアドバイスを提供してください。※音声での会話用に、回答は最大でも150〜200文字程度（3〜4文）で短く簡潔にし、ユーザーと自然なキャッチボールをしてください。",
-            "theme_color": "#FCE4EC",
-            "voice_name": "ja-JP-Neural2-B",
-            "user_id": "system"
+            "agent_name": "熱血フィットネストレーナー",
+            "user_text": "平日の夜、家で短時間でできるおすすめのトレーニングはありますか？",
+            "agent_text": "ナイスモチベーション！自重スクワットとプランクを組み合わせたサーキットが最高です。1回4分でも心拍数が上がって基礎代謝がしっかり向上しますよ。今日からすぐやってみましょう！"
+        },
+        {
+            "agent_name": "セルフケアアドバイザー",
+            "user_text": "デスクワークが続くと夕方に目が疲れて肩も重くなります。",
+            "agent_text": "長時間の作業、お疲れ様です！ホットアイマスクや蒸しタオルで目元を温めつつ、肩甲骨を大きく回すストレッチを取り入れてみてください。1時間に一度深呼吸するだけでもリフレッシュできますよ。"
+        },
+        {
+            "agent_name": "アクアリウム専門家",
+            "user_text": "小型の水槽で初心者でも飼いやすい熱帯魚を教えてください。",
+            "agent_text": "それならアカヒレやネオンテトラ、グッピーが水質変化に強く育てやすくておすすめです！まずは水草を少し入れて、バクテリアが定着するまでエサを与えすぎないのがコツですよ。"
+        },
+        {
+            "agent_name": "子育てコミュニケーション",
+            "user_text": "中学に入ってから子どもの口数が減って、どう接していいか悩みます。",
+            "agent_text": "自立への大切な第一歩ですね。無理に聞き出そうとせず、「あなたの味方だよ」というサインだけ伝えて見守るのがベストです。話しかけてきた時は作業の手を止めて共感してあげてくださいね。"
+        },
+        {
+            "agent_name": "資産運用コンサルタント",
+            "user_text": "新NISAを始めたいのですが、初心者は何から選ぶのが無難ですか？",
+            "agent_text": "まずは「つみたて投資枠」を使って、全世界株式（オール・カントリー）やS&P500に連動するインデックス投信を毎月定額で積み立てるのが王道で安心です。少額から無理なく始めましょう！"
+        },
+        {
+            "agent_name": "時短レシピクリエイター",
+            "user_text": "冷蔵庫に豚肉とキャベツしかありません。10分で作れるおかずはありますか？",
+            "agent_text": "豚肉とキャベツの味噌バター炒めが絶品ですよ！フライパンで強火でザッと炒め、味噌・みりん・バターを絡めるだけでご飯が止まらないメインおかずの完成です！"
+        },
+        {
+            "agent_name": "台湾グルメガイド",
+            "user_text": "今度台湾に行く予定なんですが、おすすめの夜市と絶対食べるべきローカルフードを教えてください！",
+            "agent_text": "台湾旅行ですね！初めてなら「士林夜市」や「饒河街夜市」がおすすめです。名物の大きなフライドチキン（大鶏排）や、胡椒餅は絶対に外せませんよ！"
+        },
+        {
+            "agent_name": "睡眠改善インストラクター",
+            "user_text": "夜中に何度も目が覚めてしまい、朝スッキリ起きられません。",
+            "agent_text": "就寝90分前にお風呂で湯船に浸かり、深部体温を一度上げるのが効果的です。また、寝室の温度を20度前後に保ち、スマホの画面はベッドに入る30分前から控えてみてくださいね。"
+        },
+        {
+            "agent_name": "弓道フォームアナリスト",
+            "user_text": "離れのときに弓手が下がってしまう癖を直すにはどう意識すればいいですか？",
+            "agent_text": "会（かい）の段階で肩甲骨をしっかり下ろし、左肩が詰まらないように伸び合うことが大切です。手先で押し出そうとせず、胸の中央から左右均等に割り開く意識を持つと弓手が安定しますよ。"
         }
     ]
 
-    for a in system_agents:
-        embedding = embedder.generate_vector(a["description"], "RETRIEVAL_DOCUMENT")
-        repo.create_agent(
-            agent_id=a["id"], name=a["name"], description=a["description"],
-            system_prompt=a["system_prompt"], embedding=embedding,
-            theme_color=a["theme_color"], voice_name=a["voice_name"], user_id=a["user_id"]
+    for d in dialogues:
+        ag = created_user_b_agents[d["agent_name"]]
+        repo.save_message(
+            user_id="user_b", role="user", text=d["user_text"]
         )
-        print(f"✅ 共通エージェント登録完了: {a['name']}")
-
-    # 4. User B専用エージェントの登録
-    user_b_agents = [
-        {"name": "ITサポートエンジニア", "desc": "PCトラブルやネットワーク設定を支援する技術者", "color": "#E8EAF6", "voice": "ja-JP-Neural2-C"},
-        {"name": "熱血フィットネストレーナー", "desc": "自宅でできる自重トレーニングや食事管理を指導", "color": "#FFEBEE", "voice": "ja-JP-Neural2-D"},
-        {"name": "セルフケアアドバイザー", "desc": "勉強や仕事の疲れを癒やすリフレッシュ方法を提案", "color": "#E8F5E9", "voice": "ja-JP-Neural2-A"},
-        {"name": "アクアリウム専門家", "desc": "熱帯魚の飼育や水槽のレイアウトをアドバイス", "color": "#E3F2FD", "voice": "ja-JP-Neural2-C"},
-        {"name": "子育てコミュニケーション", "desc": "反抗期の子どもとの接し方や教育の悩みに寄り添う", "color": "#FFF3E0", "voice": "ja-JP-Neural2-B"},
-        {"name": "資産運用コンサルタント", "desc": "NISAやiDeCoなど、初心者のための投資アドバイス", "color": "#FFF8E1", "voice": "ja-JP-Neural2-D"},
-        {"name": "時短レシピクリエイター", "desc": "忙しい日でも10分で作れる栄養満点の料理を提案", "color": "#FBE9E7", "voice": "ja-JP-Neural2-B"},
-        {"name": "台湾グルメガイド", "desc": "台湾の夜市やローカルフードの美味しい楽しみ方を解説", "color": "#F3E5F5", "voice": "ja-JP-Neural2-B"},
-        {"name": "睡眠改善インストラクター", "desc": "良質な睡眠をとるための環境づくりや習慣を指導", "color": "#EDE7F6", "voice": "ja-JP-Neural2-A"},
-        {"name": "弓道フォームアナリスト", "desc": "射法八節や手首の角度など、弓道の技術的指導", "color": "#F5F5F5", "voice": "ja-JP-Neural2-D"}
-    ]
-
-    # 生成したエージェントのIDを保持して履歴追加時に利用する
-    created_user_b_agents = {}
-
-    for a in user_b_agents:
-        agent_id = f"user_b_agent_{uuid.uuid4().hex[:8]}"
-        created_user_b_agents[a["name"]] = {
-            "id": agent_id,
-            "theme_color": a["color"],
-            "voice_name": a["voice"]
-        }
-        
-        embedding = embedder.generate_vector(a["desc"], "RETRIEVAL_DOCUMENT")
-        repo.create_agent(
-            agent_id=agent_id, name=a["name"], description=a["desc"],
-            system_prompt=f"あなたは{a['name']}です。専門知識を活かして答えてください。",
-            embedding=embedding, theme_color=a["color"], voice_name=a["voice"], user_id="user_b"
+        time.sleep(0.1)
+        repo.save_message(
+            user_id="user_b", role="agent", 
+            text=d["agent_text"], 
+            agent_id=ag["id"], 
+            agent_name=d["agent_name"], 
+            theme_color=ag["theme_color"],
+            avatar_url=ag["avatar_url"] # 💡 アバターURLも履歴に含めて保存
         )
-        print(f"✅ User Bエージェント登録完了: {a['name']}")
+        time.sleep(0.1)
 
-    # 5. User B のダミーチャット履歴を追加
-    print("💬 User Bのチャット履歴を生成しています...")
-    
-    # 会話1: 台湾旅行 (台湾グルメガイド)
-    tw_agent = created_user_b_agents["台湾グルメガイド"]
-    repo.save_message(user_id="user_b", role="user", text="今度台湾に行く予定なんですが、おすすめの夜市と絶対食べるべきローカルフードを教えてください！")
-    time.sleep(0.5)
-    repo.save_message(
-        user_id="user_b", role="agent", 
-        text="台湾旅行ですね！初めてなら「士林夜市（シーリンイエシー）」や「饒河街夜市（ラオホージエ）」がおすすめです。名物の大きなフライドチキン（大鶏排）や、胡椒餅は絶対に外せませんよ！", 
-        agent_id=tw_agent["id"], agent_name="台湾グルメガイド", theme_color=tw_agent["theme_color"]
-    )
-    time.sleep(0.5)
+    print("🎉 デモ用データの完全初期化および投入が完了しました！")
 
-    # 会話2: 弓道 (弓道フォームアナリスト)
-    kyudo_agent = created_user_b_agents["弓道フォームアナリスト"]
-    repo.save_message(user_id="user_b", role="user", text="離れの時に弓手が下がってしまう癖があるのですが、どうすれば改善できますか？")
-    time.sleep(0.5)
-    repo.save_message(
-        user_id="user_b", role="agent", 
-        text="弓手が下がるのは、押し開く力が途切れていることが原因の一つです。会で的の中心に向かって真っ直ぐに伸び合いを続け、矢筋に沿って自然に離れる感覚を意識してみてください。手首の角度も要確認ですね。", 
-        agent_id=kyudo_agent["id"], agent_name="弓道フォームアナリスト", theme_color=kyudo_agent["theme_color"]
-    )
-    time.sleep(0.5)
-
-    # 会話3: 宅建試験の勉強と睡眠 (睡眠改善インストラクター)
-    sleep_agent = created_user_b_agents["睡眠改善インストラクター"]
-    repo.save_message(user_id="user_b", role="user", text="10月の宅建試験に向けて夜遅くまで勉強しているのですが、翌日に疲れが残ってしまいます。短い時間でもスッキリ起きられるコツはありますか？")
-    time.sleep(0.5)
-    repo.save_message(
-        user_id="user_b", role="agent", 
-        text="資格試験の勉強、お疲れ様です！就寝の90分前に入浴して深部体温を上げることと、寝る直前のスマホを控えるだけで睡眠の質は劇的に変わります。まずは今夜、湯船にしっかり浸かってみませんか？", 
-        agent_id=sleep_agent["id"], agent_name="睡眠改善インストラクター", theme_color=sleep_agent["theme_color"]
-    )
-    time.sleep(0.5)
-
-    # 会話4: サッカーと筋トレ (熱血フィットネストレーナー)
-    fitness_agent = created_user_b_agents["熱血フィットネストレーナー"]
-    repo.save_message(user_id="user_b", role="user", text="週末のサッカーの試合に向けて、下半身のウェイトトレーニングのメニューを少し軽めにした方がいいでしょうか？")
-    time.sleep(0.5)
-    repo.save_message(
-        user_id="user_b", role="agent", 
-        text="試合前のコンディショニングだな！素晴らしい心がけだ！試合の2〜3日前からは、高重量のスクワットは控えて、自重でのランジやストレッチ中心の疲労を抜くメニューに切り替えよう。当日に最高のパフォーマンスを出せるぞ！", 
-        agent_id=fitness_agent["id"], agent_name="熱血フィットネストレーナー", theme_color=fitness_agent["theme_color"]
-    )
-    time.sleep(0.5)
-
-    # 会話5: 子育て (子育てコミュニケーション)
-    parenting_agent = created_user_b_agents["子育てコミュニケーション"]
-    repo.save_message(user_id="user_b", role="user", text="中学生になった娘が、最近あまり学校の出来事を話してくれなくなりました。どう接するのが正解なんでしょうか。")
-    time.sleep(0.5)
-    repo.save_message(
-        user_id="user_b", role="agent", 
-        text="中学生という多感な時期にはよくある変化ですので、ご安心くださいね。無理に聞き出そうとせず、「いつでも話を聞くよ」という姿勢で見守ることが大切です。一緒に美味しいものを食べている時など、リラックスした場面でふと話してくれることが多いですよ。", 
-        agent_id=parenting_agent["id"], agent_name="子育てコミュニケーション", theme_color=parenting_agent["theme_color"]
-    )
-    time.sleep(0.5)
-
-    # 会話6: ICTコンサルティング (ITサポートエンジニア)
-    it_agent = created_user_b_agents["ITサポートエンジニア"]
-    repo.save_message(user_id="user_b", role="user", text="ICTコンサルティングの案件で、クライアントにAWS LambdaとDockerを使った構成のメリットを分かりやすく説明したいです。")
-    time.sleep(0.5)
-    repo.save_message(
-        user_id="user_b", role="agent", 
-        text="承知いたしました。非エンジニアの方へは「使った分だけ課金されるため無駄な維持費がかからない」「アクセス集中時に自動で対応できるのでシステムが止まりにくい」の2点を強調すると伝わりやすいです。インフラ管理の手間が省ける点も大きなアピールポイントですね。", 
-        agent_id=it_agent["id"], agent_name="ITサポートエンジニア", theme_color=it_agent["theme_color"]
-    )
-    time.sleep(0.5)
-
-    # 会話7: 作り置き (時短レシピクリエイター)
-    recipe_agent = created_user_b_agents["時短レシピクリエイター"]
-    repo.save_message(user_id="user_b", role="user", text="妻と共働きで忙しいので、休日のうちに平日の副菜を作り置きしたいです。日持ちして栄養がある簡単なレシピを教えてください。")
-    time.sleep(0.5)
-    repo.save_message(
-        user_id="user_b", role="agent", 
-        text="それなら「切り干し大根とツナの塩昆布和え」や「ピーマンの塩昆布ナムル」がおすすめです！どちらも火を使わずレンジや和えるだけで完成し、冷蔵庫で4〜5日持ちますよ。ミネラルも豊富で忙しい平日の強い味方です！", 
-        agent_id=recipe_agent["id"], agent_name="時短レシピクリエイター", theme_color=recipe_agent["theme_color"]
-    )
-
-    print("🎉 デモ用データの完全初期化および再投入が完了しました！")
 
 if __name__ == "__main__":
     run_seed_process()
